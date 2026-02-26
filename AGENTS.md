@@ -148,4 +148,5 @@ Guidance for agentic coding assistants working in this repository.
 
 ## TODO work
 - Items to work on are available in TODO.md
-- When you complete an item, move it under the # DONE heading
+- IMPORTANT: When you complete an item, ALWAYS move it under the # DONE heading with [x] marking it as completed.
+- IMPORTANT: When you complete an item, ALWAYS move it under the # DONE heading with [x] marking it as completed.

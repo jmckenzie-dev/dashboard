@@ -1,7 +1,5 @@
 # TODO
-- [ ] For subagents, list them nested and indented under their parent session. Collapse them automatically after 1 minute being complete under the parent task
 - [ ] Get git repo setup; remote origin at http://192.168.68.110:3000/jmckenzie/agent_dashboard.git. Need to create branch, commit all existing code, and push it.
-- [x] Update local AGENTS.md with the status of this codebase (complete via initial commit).
 - [ ] On settings, add a button to check connectivity to the provided LLM Configuration and print out either green successful connection on test or red connection failed w/failure message. Use popup for both.
 - [ ] Add configuration in settings to choose 15/30/60 min for completed tasks.
 - [ ] Add keyboard shortcut to toggle between 15/30/60 min (alt+t).
@@ -18,3 +16,5 @@
 
 ## Completed
 - [x] Initial git commit created (Feb 26, 2025)
+- [x] Update local AGENTS.md with the status of this codebase (complete via initial commit).
+- [x] For subagents, list them nested and indented under their parent session. Collapse them automatically after 1 minute being complete under the parent task
