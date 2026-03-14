@@ -65,7 +65,9 @@ export async function getAllSessions(): Promise<AgentSession[]> {
   const activeSessions = all.filter(session => {
     const updated = session.lastActivity.getTime();
     if (session.pid) return true;
+    if (session.isActiveInstance) return true;
     if (updated > recentWindow) return true;
+    if (session.status === 'retry' && updated > blockedWindow) return true;
     if (session.status === "blocked" && updated > blockedWindow) return true;
     if (session.status === "complete" && updated > completeWindow) return true;
     return false;
@@ -106,7 +108,8 @@ export async function getStatusCounts(): Promise<Record<AgentStatus, number>> {
     working: sessions.filter(s => s.status === 'working').length,
     blocked: sessions.filter(s => s.status === 'blocked').length,
     complete: sessions.filter(s => s.status === 'complete').length,
-    idle: sessions.filter(s => s.status === 'idle').length
+    idle: sessions.filter(s => s.status === 'idle').length,
+    retry: sessions.filter(s => s.status === 'retry').length
   };
 }
 

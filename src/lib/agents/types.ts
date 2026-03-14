@@ -1,6 +1,6 @@
 export type AgentType = 'opencode' | 'claude' | 'codex' | 'gemini';
 
-export type AgentStatus = 'working' | 'blocked' | 'complete' | 'idle';
+export type AgentStatus = 'working' | 'blocked' | 'complete' | 'idle' | 'retry';
 
 export interface AgentSession {
   id: string;
@@ -16,6 +16,8 @@ export interface AgentSession {
   pty?: string;
   messages: AgentMessage[];
   canSendInput: boolean;
+  isActiveInstance?: boolean;
+  mode?: string;
 }
 
 export interface AgentMessage {

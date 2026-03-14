@@ -1,5 +1,4 @@
 import type { AgentSession, AgentMessage } from './types';
-import { classifyStatus } from '../status/patterns';
 import { loadConfig } from '../config';
 import { existsSync } from 'node:fs';
 import type Database from 'better-sqlite3';
@@ -26,13 +25,6 @@ interface OpenCodeSessionRow {
   time_updated: number;
 }
 
-interface OpenCodeMessageRow {
-  id: string;
-  session_id: string;
-  time_created: number;
-  data: string;
-}
-
 interface OpenCodePartRow {
   id: string;
   session_id: string;
@@ -41,17 +33,48 @@ interface OpenCodePartRow {
   data: string;
 }
 
+interface OpenCodeSessionStatusResponse {
+  type: 'idle' | 'busy' | 'retry';
+  attempt?: number;
+  message?: string;
+  next?: number;
+}
+
+type OpenCodeSessionStatus = 'idle' | 'busy' | 'retry';
+
 interface ParsedPartData {
   messages: AgentMessage[];
-  recentContent: string;
   latestToolStatus: string | null;
   latestStepReason: string | null;
   lastPartTime: number | null;
 }
 
+function toEpochMs(value: number | null | undefined): number {
+  if (!Number.isFinite(value)) return 0;
+  const numeric = Math.trunc(value as number);
+  if (numeric <= 0) return 0;
+
+  if (numeric < 1e11) {
+    return numeric * 1000;
+  }
+
+  if (numeric < 1e14) {
+    return numeric;
+  }
+
+  if (numeric < 1e17) {
+    return Math.trunc(numeric / 1000);
+  }
+
+  return Math.trunc(numeric / 1_000_000);
+}
+
+function toDate(value: number | null | undefined): Date {
+  return new Date(toEpochMs(value));
+}
+
 function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
   const messages: AgentMessage[] = [];
-  const statusText: string[] = [];
   let latestToolStatus: string | null = null;
   let latestStepReason: string | null = null;
   let lastPartTime: number | null = null;
@@ -77,23 +100,21 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
     }
 
     if (data.type === 'text' && typeof data.text === 'string' && data.text.trim()) {
-      statusText.push(data.text);
       messages.push({
         id: part.id,
         role: 'assistant',
         content: data.text,
-        timestamp: new Date(part.time_created)
+        timestamp: toDate(part.time_created)
       });
       continue;
     }
 
     if (data.type === 'reasoning' && typeof data.text === 'string' && data.text.trim()) {
-      statusText.push(data.text);
       messages.push({
         id: part.id,
         role: 'assistant',
         content: data.text,
-        timestamp: new Date(part.time_created)
+        timestamp: toDate(part.time_created)
       });
       continue;
     }
@@ -108,7 +129,7 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
           id: part.id,
           role: 'system',
           content: text,
-          timestamp: new Date(part.time_created)
+          timestamp: toDate(part.time_created)
         });
       }
     }
@@ -117,7 +138,6 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
   const trimmed = messages.slice(-25);
   return {
     messages: trimmed,
-    recentContent: statusText.slice(-8).join('\n'),
     latestToolStatus,
     latestStepReason,
     lastPartTime
@@ -125,35 +145,26 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
 }
 
 function inferOpencodeStatus(
-  recentContent: string,
-  lastActivityMs: number,
+  sessionStatus: OpenCodeSessionStatus | null,
   latestToolStatus: string | null,
   latestStepReason: string | null,
+  lastActivityMs: number,
 ) {
-  const base = classifyStatus('opencode', recentContent, lastActivityMs);
+  if (sessionStatus === 'retry') return 'retry';
+  if (sessionStatus === 'busy') return 'working';
 
-  if (base === 'blocked') {
-    return 'blocked';
-  }
-
-  if (base === 'complete' && lastActivityMs < 45_000) {
+  if (latestToolStatus === 'running' || latestToolStatus === 'pending') {
     return 'working';
   }
 
-  if (latestToolStatus === 'running') {
-    if (lastActivityMs > 90_000) return 'blocked';
+  if (latestStepReason && !['tool-calls', 'unknown'].includes(latestStepReason)) {
+    if (lastActivityMs > 45_000) return 'complete';
     return 'working';
   }
 
-  if (latestStepReason === 'stop' && lastActivityMs > 45_000) {
-    return 'complete';
-  }
+  if (sessionStatus === 'idle') return 'complete';
 
-  if (latestStepReason === 'tool-calls' && lastActivityMs > 90_000) {
-    return 'blocked';
-  }
-
-  return base;
+  return lastActivityMs < 60_000 ? 'working' : 'idle';
 }
 
 async function checkAPIServer(apiBase: string): Promise<boolean> {
@@ -187,6 +198,13 @@ async function getSessionsViaAPI(apiBase: string): Promise<AgentSession[]> {
       time: { created: number; updated: number };
     }>;
     
+    const statusResponse = await fetch(`${apiBase}/session/status`, {
+      headers: { 'x-opencode-directory': '/' }
+    });
+    const statusData = statusResponse.ok
+      ? await statusResponse.json() as Record<string, OpenCodeSessionStatusResponse>
+      : {};
+
     const result: AgentSession[] = [];
     
     for (const session of sessions) {
@@ -195,41 +213,72 @@ async function getSessionsViaAPI(apiBase: string): Promise<AgentSession[]> {
       });
       
       let messages: AgentMessage[] = [];
-      let recentContent = '';
-      
+      let latestToolStatus: string | null = null;
+      let latestStepReason: string | null = null;
+      let currentMode: string | undefined;
+
       if (msgResponse.ok) {
-        const msgs = await msgResponse.json() as Array<{
-          id: string;
-          role: string;
-          content?: { parts?: Array<{ text?: string }> };
-          time_created?: number;
+        const msgData = await msgResponse.json() as Array<{
+          info: {
+            id: string;
+            role: string;
+            agent?: string;
+            time?: { created?: number };
+          };
+          parts: Array<{ type: string; text?: string; state?: { status?: string }; reason?: string }>;
         }>;
-        
-        messages = msgs.slice(-20).map(m => ({
-          id: m.id,
-          role: m.role as 'user' | 'assistant' | 'system',
-          content: m.content?.parts?.map(p => p.text || '').join('') || '',
-          timestamp: new Date(m.time_created || Date.now())
-        }));
-        
-        recentContent = messages.map(m => m.content).join('\n');
+        for (const message of msgData.slice(-10)) {
+          // Track the agent/mode from the most recent message that has it
+          if (message.info.agent) {
+            currentMode = message.info.agent;
+          }
+
+          for (const part of message.parts) {
+            if (part.type === 'tool' && part.state?.status) {
+              latestToolStatus = String(part.state.status);
+            }
+
+            if (part.type === 'step-finish' && part.reason) {
+              latestStepReason = String(part.reason);
+            }
+
+            if (part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
+              messages.push({
+                id: message.info.id,
+                role: message.info.role as 'user' | 'assistant' | 'system',
+                content: part.text,
+                timestamp: toDate(message.info.time?.created ?? Date.now())
+              });
+            }
+          }
+        }
       }
       
-      const lastActivity = new Date(session.time.updated);
+      const lastActivity = toDate(session.time.updated);
       const lastActivityMs = Date.now() - lastActivity.getTime();
       const parentRaw = session.parent_id || session.parentId || null;
       
+      const sessionStatus = statusData[session.id]?.type ?? null;
+      const hasActiveInstance = Object.prototype.hasOwnProperty.call(statusData, session.id);
+
       result.push({
         id: `opencode-${session.id}`,
         parentId: parentRaw ? `opencode-${parentRaw}` : undefined,
         type: 'opencode',
         name: session.title || 'Untitled Session',
         summary: '',
-        status: inferOpencodeStatus(recentContent, lastActivityMs, null, null),
+        status: inferOpencodeStatus(
+          sessionStatus,
+          latestToolStatus,
+          latestStepReason,
+          lastActivityMs,
+        ),
         directory: session.directory,
         lastActivity,
         messages,
-        canSendInput: true
+        canSendInput: true,
+        isActiveInstance: hasActiveInstance,
+        mode: currentMode
       });
     }
     
@@ -267,7 +316,7 @@ async function getSessionsViaSQLite(dbPath: string): Promise<AgentSession[]> {
 
       const parsed = parsePartData(parts);
       const lastTime = parsed.lastPartTime ?? session.time_updated;
-      const lastActivity = new Date(lastTime);
+      const lastActivity = toDate(lastTime);
       const lastActivityMs = Date.now() - lastActivity.getTime();
       
       result.push({
@@ -277,10 +326,10 @@ async function getSessionsViaSQLite(dbPath: string): Promise<AgentSession[]> {
         name: session.title || 'Untitled Session',
         summary: '',
         status: inferOpencodeStatus(
-          parsed.recentContent,
-          lastActivityMs,
+          null,
           parsed.latestToolStatus,
           parsed.latestStepReason,
+          lastActivityMs,
         ),
         directory: session.directory,
         lastActivity,

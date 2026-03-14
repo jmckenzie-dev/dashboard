@@ -50,8 +50,23 @@ stop_dashboard() {
 
 start_dashboard() {
   echo "Starting dashboard..."
-  bash "$START_SCRIPT"
+  bash "$START_SCRIPT" >>"$LOG_FILE" 2>&1 &
 }
 
+run_pre_restart_checks() {
+  echo "Running npm run check..."
+  (
+    cd "$SCRIPT_DIR"
+    npm run check
+  )
+
+  echo "Running npm run build..."
+  (
+    cd "$SCRIPT_DIR"
+    npm run build
+  )
+}
+
+run_pre_restart_checks
 stop_dashboard
 start_dashboard

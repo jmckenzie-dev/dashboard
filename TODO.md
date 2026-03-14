@@ -1,4 +1,6 @@
 # TODO
+- [ ] Get opencode status deterministic
+- [ ] Auto collapse w/subagents by default. Show (N subagents active of M total) or something instead in title.
 - [ ] Get git repo setup; remote origin at http://192.168.68.110:3000/jmckenzie/agent_dashboard.git. Need to create branch, commit all existing code, and push it.
 - [ ] On settings, add a button to check connectivity to the provided LLM Configuration and print out either green successful connection on test or red connection failed w/failure message. Use popup for both.
 - [ ] Add configuration in settings to choose 15/30/60 min for completed tasks.

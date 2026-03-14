@@ -25,7 +25,8 @@ export const load: PageServerLoad = async () => {
         content: m.content,
         timestamp: m.timestamp.toISOString()
       })),
-      canSendInput: session.canSendInput
+      canSendInput: session.canSendInput,
+      mode: session.mode
     }))
   );
   

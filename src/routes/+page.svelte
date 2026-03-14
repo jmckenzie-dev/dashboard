@@ -8,16 +8,18 @@
     type: string;
     name: string;
     summary: string;
-    status: 'working' | 'blocked' | 'complete' | 'idle';
+    status: 'working' | 'blocked' | 'complete' | 'idle' | 'retry';
     project?: string;
     directory?: string;
     lastActivity: string;
     messages: Array<{ id: string; role: string; content: string; timestamp: string }>;
     canSendInput: boolean;
+    mode?: string;
   };
 
   type Counts = {
     working: number;
+    retry: number;
     blocked: number;
     complete: number;
     idle: number;
@@ -28,7 +30,7 @@
   let sessions = $state<Session[]>([]);
   let rootSessions = $state<Session[]>([]);
   let childrenByParentId = $state<Record<string, Session[]>>({});
-  let counts = $state<Counts>({ working: 0, blocked: 0, complete: 0, idle: 0 });
+  let counts = $state<Counts>({ working: 0, retry: 0, blocked: 0, complete: 0, idle: 0 });
   let expandedId = $state<string | null>(null);
   let expandedSubagents = $state<Record<string, boolean>>({});
   let inputText = $state<Record<string, string>>({});
@@ -152,6 +154,7 @@
 
   function statusClass(status: Session['status']) {
     if (status === 'working') return 'badge-working';
+    if (status === 'retry') return 'badge-retry';
     if (status === 'blocked') return 'badge-blocked';
     if (status === 'complete') return 'badge-complete';
     return 'badge-idle';
@@ -161,7 +164,16 @@
     if (status === 'working') return '🔵';
     if (status === 'blocked') return '🔴';
     if (status === 'complete') return '🟢';
+    if (status === 'retry') return '🟠';
     return '⚪';
+  }
+
+  function statusLabel(status: Session['status']) {
+    if (status === 'working') return 'Working';
+    if (status === 'blocked') return 'Blocked';
+    if (status === 'complete') return 'Complete';
+    if (status === 'retry') return 'Retrying';
+    return 'Idle';
   }
 
   function agentIcon(type: string) {
@@ -199,11 +211,12 @@
   <a href="/settings" class="settings-link">Settings</a>
 </header>
 
-<section class="status-bar">
-  <span class="badge badge-working">🔵 {counts.working} Working</span>
-  <span class="badge badge-blocked">🔴 {counts.blocked} Blocked</span>
-  <span class="badge badge-complete">🟢 {counts.complete} Complete</span>
-  <span class="badge badge-idle">⚪ {counts.idle} Idle</span>
+  <section class="status-bar">
+    <span class="badge badge-working">🔵 {counts.working} Working</span>
+    <span class="badge badge-retry">🟠 {counts.retry} Retrying</span>
+    <span class="badge badge-blocked">🔴 {counts.blocked} Blocked</span>
+    <span class="badge badge-complete">🟢 {counts.complete} Complete</span>
+    <span class="badge badge-idle">⚪ {counts.idle} Idle</span>
 </section>
 
 <main class="main">
@@ -226,8 +239,11 @@
           </span>
           <span class="meta">
             <span class={`badge ${statusClass(session.status)}`}>
-              {statusDot(session.status)} {session.status}
+              {statusDot(session.status)} {statusLabel(session.status)}
             </span>
+            {#if session.mode}
+              <span class="badge badge-mode">{session.mode}</span>
+            {/if}
             <span class="time">{formatTime(session.lastActivity)}</span>
           </span>
         </button>
@@ -299,9 +315,12 @@
                       <span class="summary">{child.summary || 'No summary yet'}</span>
                     </span>
                     <span class="meta">
-                      <span class={`badge ${statusClass(child.status)}`}>
-                        {statusDot(child.status)} {child.status}
-                      </span>
+                    <span class={`badge ${statusClass(child.status)}`}>
+                      {statusDot(child.status)} {statusLabel(child.status)}
+                    </span>
+                    {#if child.mode}
+                      <span class="badge badge-mode">{child.mode}</span>
+                    {/if}
                       <span class="time">{formatTime(child.lastActivity)}</span>
                     </span>
                   </button>
@@ -435,6 +454,10 @@
 
   .card[data-status='blocked'] {
     border-left-color: var(--accent-red);
+  }
+
+  .card[data-status='retry'] {
+    border-left-color: var(--accent-orange);
   }
 
   .card[data-status='complete'] {
