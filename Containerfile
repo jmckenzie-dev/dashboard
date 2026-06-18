@@ -6,7 +6,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=optional
 
 COPY . .
-RUN npm run build
+RUN mkdir -p static && npm run build
 
 FROM node:22-alpine AS runtime
 

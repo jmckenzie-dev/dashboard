@@ -33,3 +33,9 @@ Thumbs.db
 
 # Coverage
 coverage/
+.antigravitycli/
+.codegraphcontext/
+.serena/
+*wt_*
+__pycache__
+logs/

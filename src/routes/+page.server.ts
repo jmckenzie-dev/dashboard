@@ -1,10 +1,10 @@
 import type { PageServerLoad } from './$types';
-import { getAllSessions, getStatusCounts } from '$lib/agents/index';
+import { countStatuses, getAllSessions } from '$lib/agents/index';
 import { generateSummary } from '$lib/llm/summarizer';
 
 export const load: PageServerLoad = async () => {
   const sessions = await getAllSessions();
-  const counts = await getStatusCounts();
+  const counts = countStatuses(sessions);
   
   const sessionsWithSummaries = await Promise.all(
     sessions.map(async (session) => ({
@@ -26,7 +26,12 @@ export const load: PageServerLoad = async () => {
         timestamp: m.timestamp.toISOString()
       })),
       canSendInput: session.canSendInput,
-      mode: session.mode
+      mode: session.mode,
+      blockReason: session.blockReason ?? null,
+      // Preserve three-valued liveness: `true` (confirmed alive) or undefined
+      // (unknown). Phase 1 never sets `false`; see docs/opencode-liveness-phase2.md.
+      instanceAlive: session.instanceAlive === true ? true : undefined,
+      blockingRequestIds: session.blockingRequestIds ?? []
     }))
   );
   

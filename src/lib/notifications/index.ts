@@ -1,5 +1,6 @@
 import { loadConfig, getSoundsDir } from '../config';
 import { onStatusTransition } from '../agents';
+import { isBlocked } from '../agents/types';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
@@ -31,7 +32,7 @@ export function initializeNotifications(): () => void {
   state.initialized = true;
   
   const unsubscribe = onStatusTransition(async (transition) => {
-    if (transition.toStatus === 'blocked') {
+    if (isBlocked(transition.toStatus)) {
       await triggerNotification('blocked', transition.sessionId);
     } else if (transition.toStatus === 'complete') {
       await triggerNotification('complete', transition.sessionId);

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { PageData } from './$types';
+  import type { AgentStatus } from '$lib/agents/types';
   import { onDestroy, onMount } from 'svelte';
 
   type Session = {
@@ -8,33 +9,50 @@
     type: string;
     name: string;
     summary: string;
-    status: 'working' | 'blocked' | 'complete' | 'idle' | 'retry';
+    status: AgentStatus;
     project?: string;
     directory?: string;
     lastActivity: string;
     messages: Array<{ id: string; role: string; content: string; timestamp: string }>;
     canSendInput: boolean;
     mode?: string;
+    blockReason?: 'permission' | 'question' | 'review' | null;
+    instanceAlive?: boolean;
+    blockingRequestIds?: string[];
   };
 
-  type Counts = {
-    working: number;
-    retry: number;
-    blocked: number;
-    complete: number;
-    idle: number;
-  };
+  type Counts = Record<
+    | 'working'
+    | 'blocked'
+    | 'blocked_permission'
+    | 'blocked_question'
+    | 'blocked_review'
+    | 'complete'
+    | 'idle'
+    | 'retry',
+    number
+  >;
 
   let { data }: { data: PageData } = $props();
 
   let sessions = $state<Session[]>([]);
   let rootSessions = $state<Session[]>([]);
   let childrenByParentId = $state<Record<string, Session[]>>({});
-  let counts = $state<Counts>({ working: 0, retry: 0, blocked: 0, complete: 0, idle: 0 });
+  let counts = $state<Counts>({
+    working: 0,
+    blocked: 0,
+    blocked_permission: 0,
+    blocked_question: 0,
+    blocked_review: 0,
+    complete: 0,
+    idle: 0,
+    retry: 0,
+  });
   let expandedId = $state<string | null>(null);
   let expandedSubagents = $state<Record<string, boolean>>({});
   let inputText = $state<Record<string, string>>({});
   let sending = $state<Record<string, boolean>>({});
+  let resolving = $state<Record<string, boolean>>({});
   let pollTimer = $state<ReturnType<typeof setInterval> | null>(null);
   let pollInFlight = $state(false);
 
@@ -152,28 +170,59 @@
     return d.toLocaleDateString();
   }
 
-  function statusClass(status: Session['status']) {
-    if (status === 'working') return 'badge-working';
-    if (status === 'retry') return 'badge-retry';
-    if (status === 'blocked') return 'badge-blocked';
-    if (status === 'complete') return 'badge-complete';
+  function isBlockedStatus(status: AgentStatus): boolean {
+    return status === 'blocked' || status.startsWith('blocked_');
+  }
+
+  // `retry` is folded under `working` visually (blue border) with a sub-label.
+  function displayStatus(status: AgentStatus): AgentStatus {
+    return status === 'retry' ? 'working' : status;
+  }
+
+  function statusClass(status: AgentStatus) {
+    const s = displayStatus(status);
+    if (s === 'working') return 'badge-working';
+    if (s === 'blocked_permission') return 'badge-blocked-permission';
+    if (s === 'blocked_question') return 'badge-blocked-question';
+    if (s === 'blocked_review') return 'badge-blocked-review';
+    if (s === 'blocked') return 'badge-blocked';
+    if (s === 'complete') return 'badge-complete';
     return 'badge-idle';
   }
 
-  function statusDot(status: Session['status']) {
-    if (status === 'working') return '🔵';
-    if (status === 'blocked') return '🔴';
-    if (status === 'complete') return '🟢';
-    if (status === 'retry') return '🟠';
+  function statusDot(status: AgentStatus) {
+    const s = displayStatus(status);
+    if (s === 'working') return '🔵';
+    if (s === 'blocked_permission') return '🔴';
+    if (s === 'blocked_question') return '🟠';
+    if (s === 'blocked_review') return '🟡';
+    if (s === 'blocked') return '🔴';
+    if (s === 'complete') return '🟢';
     return '⚪';
   }
 
-  function statusLabel(status: Session['status']) {
-    if (status === 'working') return 'Working';
-    if (status === 'blocked') return 'Blocked';
-    if (status === 'complete') return 'Complete';
-    if (status === 'retry') return 'Retrying';
+  function statusLabel(status: AgentStatus) {
+    const s = displayStatus(status);
+    if (s === 'working') return 'Working';
+    if (s === 'blocked_permission') return 'Blocked (permission)';
+    if (s === 'blocked_question') return 'Blocked (question)';
+    if (s === 'blocked_review') return 'Blocked (awaiting review)';
+    if (s === 'blocked') return 'Blocked';
+    if (s === 'complete') return 'Complete';
     return 'Idle';
+  }
+
+  function isRetrying(status: AgentStatus): boolean {
+    return status === 'retry';
+  }
+
+  // Liveness is only positive (`instanceAlive === true`) or unknown. Surface a
+  // subtle marker only for idle/complete sessions where the question matters.
+  function showLiveness(session: Session): boolean {
+    return (
+      (session.status === 'idle' || session.status === 'complete') &&
+      session.instanceAlive === true
+    );
   }
 
   function agentIcon(type: string) {
@@ -200,6 +249,43 @@
       sending[sessionId] = false;
     }
   }
+
+  async function postAction(sessionId: string, body: Record<string, unknown>): Promise<boolean> {
+    try {
+      const res = await fetch(`/api/agents/${sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      return res.ok;
+    } catch (error) {
+      console.error('action failed', error);
+      return false;
+    }
+  }
+
+  // Approve / always-allow / reject a pending permission request.
+  async function resolvePermission(session: Session, reply: 'once' | 'always' | 'reject') {
+    const requestId = session.blockingRequestIds?.[0];
+    if (!requestId || resolving[session.id]) return;
+    resolving[session.id] = true;
+    try {
+      await postAction(session.id, { action: 'permission', requestId, reply });
+    } finally {
+      resolving[session.id] = false;
+    }
+  }
+
+  // Cancel a session (used to abort a submit_plan review awaiting Plannotator).
+  async function cancelSession(session: Session) {
+    if (resolving[session.id]) return;
+    resolving[session.id] = true;
+    try {
+      await postAction(session.id, { action: 'abort' });
+    } finally {
+      resolving[session.id] = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -212,9 +298,11 @@
 </header>
 
   <section class="status-bar">
-    <span class="badge badge-working">🔵 {counts.working} Working</span>
-    <span class="badge badge-retry">🟠 {counts.retry} Retrying</span>
-    <span class="badge badge-blocked">🔴 {counts.blocked} Blocked</span>
+    <span class="badge badge-working">🔵 {counts.working} Working{counts.retry ? ` (↻ ${counts.retry} retrying)` : ''}</span>
+    <span class="badge badge-blocked-permission">🔴 {counts.blocked_permission} Blocked (permission)</span>
+    <span class="badge badge-blocked-question">🟠 {counts.blocked_question} Blocked (question)</span>
+    <span class="badge badge-blocked-review">🟡 {counts.blocked_review} Blocked (awaiting review)</span>
+    {#if counts.blocked}<span class="badge badge-blocked">🔴 {counts.blocked} Blocked</span>{/if}
     <span class="badge badge-complete">🟢 {counts.complete} Complete</span>
     <span class="badge badge-idle">⚪ {counts.idle} Idle</span>
 </section>
@@ -224,7 +312,7 @@
     <div class="empty">No active sessions found.</div>
   {:else}
     {#each rootSessions as session (session.id)}
-      <article class="card" data-status={session.status}>
+      <article class="card" data-status={displayStatus(session.status)} class:dimmed={!showLiveness(session) && (session.status === 'idle' || session.status === 'complete') && session.type === 'opencode' && session.instanceAlive === false}>
         <button
           class="card-header"
           type="button"
@@ -241,6 +329,12 @@
             <span class={`badge ${statusClass(session.status)}`}>
               {statusDot(session.status)} {statusLabel(session.status)}
             </span>
+            {#if isRetrying(session.status)}
+              <span class="badge badge-retrying">↻ retrying</span>
+            {/if}
+            {#if showLiveness(session)}
+              <span class="badge badge-live" title="Instance is reachable">● live</span>
+            {/if}
             {#if session.mode}
               <span class="badge badge-mode">{session.mode}</span>
             {/if}
@@ -263,7 +357,7 @@
               {/each}
             </div>
 
-            {#if session.status === 'blocked'}
+            {#if session.status === 'blocked_question' || session.status === 'blocked'}
               <div class="input-row">
                 <input
                   type="text"
@@ -280,6 +374,24 @@
                 >
                   {sending[session.id] ? 'Sending...' : 'Send'}
                 </button>
+              </div>
+            {:else if session.status === 'blocked_permission'}
+              <div class="action-row">
+                <span class="action-hint">Permission request awaiting your decision.</span>
+                <div class="action-buttons">
+                  <button class="btn-primary" type="button" onclick={() => resolvePermission(session, 'once')} disabled={resolving[session.id]}>Approve once</button>
+                  <button class="btn-secondary" type="button" onclick={() => resolvePermission(session, 'always')} disabled={resolving[session.id]}>Always allow</button>
+                  <button class="btn-danger" type="button" onclick={() => resolvePermission(session, 'reject')} disabled={resolving[session.id]}>Reject</button>
+                </div>
+              </div>
+            {:else if session.status === 'blocked_review'}
+              <div class="action-row">
+                <span class="action-hint">Awaiting plan review. Approve/deny in Plannotator, or cancel the session.</span>
+                <div class="action-buttons">
+                  <button class="btn-danger" type="button" onclick={() => cancelSession(session)} disabled={resolving[session.id]}>
+                    {resolving[session.id] ? 'Cancelling...' : 'Cancel session'}
+                  </button>
+                </div>
               </div>
             {/if}
           </div>
@@ -301,7 +413,7 @@
           {#if subagentsExpanded(session.id)}
             <div class="subagent-list">
               {#each childrenByParentId[session.id] as child (child.id)}
-                <article class="card subagent-card" data-status={child.status}>
+                <article class="card subagent-card" data-status={displayStatus(child.status)} class:dimmed={!showLiveness(child) && (child.status === 'idle' || child.status === 'complete') && child.type === 'opencode' && child.instanceAlive === false}>
                   <button
                     class="card-header"
                     type="button"
@@ -318,6 +430,12 @@
                     <span class={`badge ${statusClass(child.status)}`}>
                       {statusDot(child.status)} {statusLabel(child.status)}
                     </span>
+                    {#if isRetrying(child.status)}
+                      <span class="badge badge-retrying">↻ retrying</span>
+                    {/if}
+                    {#if showLiveness(child)}
+                      <span class="badge badge-live" title="Instance is reachable">● live</span>
+                    {/if}
                     {#if child.mode}
                       <span class="badge badge-mode">{child.mode}</span>
                     {/if}
@@ -340,7 +458,7 @@
                         {/each}
                       </div>
 
-                      {#if child.status === 'blocked'}
+                      {#if child.status === 'blocked_question' || child.status === 'blocked'}
                         <div class="input-row">
                           <input
                             type="text"
@@ -357,6 +475,24 @@
                           >
                             {sending[child.id] ? 'Sending...' : 'Send'}
                           </button>
+                        </div>
+                      {:else if child.status === 'blocked_permission'}
+                        <div class="action-row">
+                          <span class="action-hint">Permission request awaiting your decision.</span>
+                          <div class="action-buttons">
+                            <button class="btn-primary" type="button" onclick={() => resolvePermission(child, 'once')} disabled={resolving[child.id]}>Approve once</button>
+                            <button class="btn-secondary" type="button" onclick={() => resolvePermission(child, 'always')} disabled={resolving[child.id]}>Always allow</button>
+                            <button class="btn-danger" type="button" onclick={() => resolvePermission(child, 'reject')} disabled={resolving[child.id]}>Reject</button>
+                          </div>
+                        </div>
+                      {:else if child.status === 'blocked_review'}
+                        <div class="action-row">
+                          <span class="action-hint">Awaiting plan review. Approve/deny in Plannotator, or cancel the session.</span>
+                          <div class="action-buttons">
+                            <button class="btn-danger" type="button" onclick={() => cancelSession(child)} disabled={resolving[child.id]}>
+                              {resolving[child.id] ? 'Cancelling...' : 'Cancel session'}
+                            </button>
+                          </div>
                         </div>
                       {/if}
                     </div>
@@ -456,12 +592,28 @@
     border-left-color: var(--accent-red);
   }
 
-  .card[data-status='retry'] {
+  .card[data-status='blocked_permission'] {
+    border-left-color: var(--accent-red);
+  }
+
+  .card[data-status='blocked_question'] {
     border-left-color: var(--accent-orange);
+  }
+
+  .card[data-status='blocked_review'] {
+    border-left-color: var(--accent-yellow-strong);
+  }
+
+  .card[data-status='retry'] {
+    border-left-color: var(--accent-blue);
   }
 
   .card[data-status='complete'] {
     border-left-color: var(--accent-green);
+  }
+
+  .card.dimmed {
+    opacity: 0.55;
   }
 
   .card-header {
@@ -558,6 +710,28 @@
 
   .input-row input {
     flex: 1;
+  }
+
+  .action-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .action-hint {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+  }
+
+  .action-buttons {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .action-buttons button {
+    padding: 0.35rem 0.7rem;
+    font-size: 0.82rem;
   }
 
   @media (max-width: 760px) {

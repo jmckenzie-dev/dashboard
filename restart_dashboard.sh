@@ -3,55 +3,34 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-START_SCRIPT="$SCRIPT_DIR/scripts/start-dashboard.sh"
-LOG_DIR="$SCRIPT_DIR/tmp"
-LOG_FILE="$LOG_DIR/dashboard-restart.log"
-PORT="35001"
-
-if [ ! -f "$START_SCRIPT" ]; then
-  echo "Error: start script not found at $START_SCRIPT"
-  exit 1
-fi
+LOG_DIR="$SCRIPT_DIR/logs"
+LOG_FILE="$LOG_DIR/restart_dashboard_$(date +%Y%m%d_%H%M%S).log"
+IMAGE="localhost/ai-agent-dashboard:local"
+SERVICE="ai-agent-dashboard.service"
 
 mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-stop_dashboard() {
-  local pids=""
+echo "Logging restart output to $LOG_FILE"
 
-  if command -v ss >/dev/null 2>&1; then
-    pids="$(ss -ltnp "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u | tr '\n' ' ' || true)"
-  fi
-
-  if [ -z "$pids" ]; then
-    pids="$(pgrep -f "$START_SCRIPT|ai-agent-dashboard|build/index.js|start:https" | tr '\n' ' ' || true)"
-  fi
-
-  if [ -n "$pids" ]; then
-    echo "Stopping dashboard processes: $pids"
-    kill $pids 2>/dev/null || true
-
-    sleep 2
-
-    local remaining
-    remaining="$(for pid in $pids; do
-      if kill -0 "$pid" 2>/dev/null; then
-        printf '%s ' "$pid"
-      fi
-    done)"
-
-    if [ -n "$remaining" ]; then
-      echo "Force stopping remaining processes: $remaining"
-      kill -9 $remaining 2>/dev/null || true
-    fi
+if ! command -v podman >/dev/null 2>&1; then
+  if command -v distrobox-host-exec >/dev/null 2>&1; then
+    podman() { distrobox-host-exec podman "$@"; }
   else
-    echo "Dashboard is not currently running."
+    echo "Error: podman not found and distrobox-host-exec is unavailable"
+    exit 1
   fi
-}
+fi
 
-start_dashboard() {
-  echo "Starting dashboard..."
-  bash "$START_SCRIPT" >>"$LOG_FILE" 2>&1 &
-}
+if systemctl --user list-units --type=service --no-pager >/dev/null 2>&1; then
+  _systemctl() { systemctl "$@"; }
+elif command -v distrobox-host-exec >/dev/null 2>&1 && \
+    distrobox-host-exec systemctl --user list-units --type=service --no-pager >/dev/null 2>&1; then
+  _systemctl() { distrobox-host-exec systemctl "$@"; }
+else
+  echo "Error: unable to access user systemd from this environment"
+  exit 1
+fi
 
 run_pre_restart_checks() {
   echo "Running npm run check..."
@@ -67,6 +46,18 @@ run_pre_restart_checks() {
   )
 }
 
+rebuild_image() {
+  echo "Building $IMAGE..."
+  podman build -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR"
+}
+
+restart_service() {
+  echo "Restarting $SERVICE..."
+  _systemctl --user restart "$SERVICE"
+}
+
 run_pre_restart_checks
-stop_dashboard
-start_dashboard
+rebuild_image
+restart_service
+
+echo "Dashboard service restarted successfully."

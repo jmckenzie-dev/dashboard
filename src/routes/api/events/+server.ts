@@ -1,7 +1,7 @@
 import type { RequestHandler } from './$types';
 import { loadConfig } from '$lib/config';
 import { checkAuth, requireAuth } from '$lib/auth';
-import { getAllSessions, getStatusCounts, onStatusTransition } from '$lib/agents';
+import { countStatuses, getAllSessions, onStatusTransition } from '$lib/agents';
 import { generateSummary } from '$lib/llm/summarizer';
 
 export const GET: RequestHandler = async (event) => {
@@ -23,7 +23,7 @@ export const GET: RequestHandler = async (event) => {
       const pollInterval = setInterval(async () => {
         try {
           const sessions = await getAllSessions();
-          const counts = await getStatusCounts();
+          const counts = countStatuses(sessions);
           
           const sessionsWithSummaries = await Promise.all(
             sessions.slice(0, 20).map(async (session) => ({

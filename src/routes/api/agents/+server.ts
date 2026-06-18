@@ -1,6 +1,6 @@
 import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
-import { getAllSessions, getStatusCounts } from '$lib/agents';
+import { countStatuses, getAllSessions } from '$lib/agents';
 import { generateSummary } from '$lib/llm/summarizer';
 import { checkAuth, requireAuth } from '$lib/auth';
 
@@ -12,7 +12,7 @@ export const GET: RequestHandler = async (event) => {
   }
   
   const sessions = await getAllSessions();
-  const counts = await getStatusCounts();
+  const counts = countStatuses(sessions);
   
   const sessionsWithSummaries = await Promise.all(
     sessions.map(async (session) => ({

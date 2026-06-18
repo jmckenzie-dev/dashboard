@@ -1,5 +1,14 @@
 import type { AgentSession, AgentType, AgentStatus, StatusTransition } from './types';
-import { getOpenCodeSessions, sendOpenCodeMessage, isAPIModeAvailable } from './opencode';
+import { isBlocked } from './types';
+import {
+  getOpenCodeSessions,
+  sendOpenCodeMessage,
+  isAPIModeAvailable,
+  replyOpenCodePermission,
+  replyOpenCodeQuestion,
+  rejectOpenCodeQuestion,
+  abortOpenCodeSession,
+} from './opencode';
 import { getClaudeSessions, sendClaudeMessage } from './claude';
 import { getCodexSessions, sendCodexMessage } from './codex';
 import { getGeminiSessions, sendGeminiMessage } from './gemini';
@@ -68,8 +77,9 @@ export async function getAllSessions(): Promise<AgentSession[]> {
     if (session.isActiveInstance) return true;
     if (updated > recentWindow) return true;
     if (session.status === 'retry' && updated > blockedWindow) return true;
-    if (session.status === "blocked" && updated > blockedWindow) return true;
-    if (session.status === "complete" && updated > completeWindow) return true;
+    // Blocked sessions are actionable — keep them visible for a long window.
+    if (isBlocked(session.status) && updated > blockedWindow) return true;
+    if (session.status === 'complete' && updated > completeWindow) return true;
     return false;
   });
   
@@ -103,14 +113,35 @@ export async function sendMessage(sessionId: string, message: string): Promise<b
 
 export async function getStatusCounts(): Promise<Record<AgentStatus, number>> {
   const sessions = await getAllSessions();
-  
-  return {
-    working: sessions.filter(s => s.status === 'working').length,
-    blocked: sessions.filter(s => s.status === 'blocked').length,
-    complete: sessions.filter(s => s.status === 'complete').length,
-    idle: sessions.filter(s => s.status === 'idle').length,
-    retry: sessions.filter(s => s.status === 'retry').length
-  };
+  return countStatuses(sessions);
+}
+
+export function countStatuses(sessions: AgentSession[]): Record<AgentStatus, number> {
+  const counts = {
+    working: 0,
+    blocked: 0,
+    blocked_permission: 0,
+    blocked_question: 0,
+    blocked_review: 0,
+    complete: 0,
+    idle: 0,
+    retry: 0,
+  } as Record<AgentStatus, number>;
+  for (const s of sessions) {
+    counts[s.status] = (counts[s.status] ?? 0) + 1;
+  }
+  return counts;
+}
+
+// Convenience: total blocked count (generic + all specific buckets) for the
+// status-bar aggregate pill.
+export function blockedTotal(counts: Record<AgentStatus, number>): number {
+  return (
+    counts.blocked +
+    counts.blocked_permission +
+    counts.blocked_question +
+    counts.blocked_review
+  );
 }
 
 export { isAPIModeAvailable };
@@ -122,3 +153,11 @@ export function getAgentTypeFromId(id: string): AgentType {
   if (id.startsWith('gemini-')) return 'gemini';
   return 'opencode';
 }
+
+// Re-export OpenCode action helpers so route handlers can resolve blocks.
+export {
+  replyOpenCodePermission,
+  replyOpenCodeQuestion,
+  rejectOpenCodeQuestion,
+  abortOpenCodeSession,
+};
