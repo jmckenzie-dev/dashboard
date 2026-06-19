@@ -1,4 +1,4 @@
-import type { AgentSession, AgentType, AgentStatus, StatusTransition } from './types';
+import type { AgentSession, AgentType, AgentStatus, StatusTransition, BlockReason } from './types';
 import { isBlocked } from './types';
 import {
   getOpenCodeSessions,
@@ -55,15 +55,85 @@ function checkTransitions(sessions: AgentSession[]): StatusTransition[] {
   return transitions;
 }
 
+/**
+ * Apply hierarchical blocking: if any descendant session is blocked, bubble
+ * the blocking status up to the parent. This matches the reference's
+ * child-to-parent bubble (reference/opencode-multiplexer/src/db/reader.ts:243-258)
+ * and extends it to the whole tree.
+ *
+ * Priority: blocked_permission > blocked_question > blocked_review
+ */
+function applyHierarchicalBlocking(sessions: AgentSession[]): void {
+  // Build parent→children map
+  const childrenByParent = new Map<string, AgentSession[]>();
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+
+  for (const session of sessions) {
+    if (session.parentId) {
+      const list = childrenByParent.get(session.parentId) ?? [];
+      list.push(session);
+      childrenByParent.set(session.parentId, list);
+    }
+  }
+
+  // Walk from leaves upward: compute child block status per parent
+  function propagateBlockedStatus(session: AgentSession): void {
+    const children = childrenByParent.get(session.id);
+    if (!children || children.length === 0) return;
+
+    // First, recursively process children
+    for (const child of children) {
+      propagateBlockedStatus(child);
+    }
+
+    // Now check if any child has a blocking status that should bubble
+    let childBlockStatus: AgentStatus | null = null;
+    const blockedPriority: AgentStatus[] = [
+      'blocked_permission',
+      'blocked_question',
+      'blocked_review',
+    ];
+
+    for (const blockedType of blockedPriority) {
+      const found = children.some((c) => c.status === blockedType || c.blockReason === blockedType.replace('blocked_', '') as BlockReason);
+      if (found) {
+        childBlockStatus = blockedType;
+        break;
+      }
+    }
+
+    if (childBlockStatus && session.status !== childBlockStatus && !isBlocked(session.status)) {
+      // Only bubble if parent isn't already in a blocking state
+      session.status = childBlockStatus;
+    }
+  }
+
+  // Process all root sessions (no parent or parent not in this set)
+  for (const session of sessions) {
+    if (!session.parentId || !byId.has(session.parentId)) {
+      propagateBlockedStatus(session);
+    }
+  }
+}
+
 export async function getAllSessions(): Promise<AgentSession[]> {
-  const [opencode, claude, codex, gemini] = await Promise.all([
-    getOpenCodeSessions(),
-    getClaudeSessions(),
-    getCodexSessions(),
-    getGeminiSessions()
-  ]);
-  
-  const all = [...opencode, ...claude, ...codex, ...gemini];
+  // NOTE: Only OpenCode is active. Claude, Codex, and Gemini agent backends
+  // are disabled to reduce per-tick I/O overhead (execSync, file reads).
+  // Re-enable when full multi-agent support is needed:
+  //   const [opencode, claude, codex, gemini] = await Promise.all([
+  //     getOpenCodeSessions(),
+  //     getClaudeSessions(),
+  //     getCodexSessions(),
+  //     getGeminiSessions()
+  //   ]);
+  //   const all = [...opencode, ...claude, ...codex, ...gemini];
+  const opencode = await getOpenCodeSessions();
+  const all = opencode;
+
+  // Apply hierarchical blocking BEFORE visibility filtering so parent
+  // sessions that become blocked via child bubble stay visible.
+  applyHierarchicalBlocking(all);
+
   checkTransitions(all);
 
   const now = Date.now();
@@ -73,6 +143,9 @@ export async function getAllSessions(): Promise<AgentSession[]> {
 
   const activeSessions = all.filter(session => {
     const updated = session.lastActivity.getTime();
+    // Gap §3.4 fix: keep sessions backed by a live process.
+    // Process-backed sessions should be visible regardless of recency.
+    if (session.instanceAlive === true) return true;
     if (session.pid) return true;
     if (session.isActiveInstance) return true;
     if (updated > recentWindow) return true;
@@ -80,6 +153,8 @@ export async function getAllSessions(): Promise<AgentSession[]> {
     // Blocked sessions are actionable — keep them visible for a long window.
     if (isBlocked(session.status) && updated > blockedWindow) return true;
     if (session.status === 'complete' && updated > completeWindow) return true;
+    // Error sessions: keep visible for a longer window so users can see them.
+    if (session.status === 'error' && updated > blockedWindow) return true;
     return false;
   });
   
@@ -126,6 +201,7 @@ export function countStatuses(sessions: AgentSession[]): Record<AgentStatus, num
     complete: 0,
     idle: 0,
     retry: 0,
+    error: 0,
   } as Record<AgentStatus, number>;
   for (const s of sessions) {
     counts[s.status] = (counts[s.status] ?? 0) + 1;

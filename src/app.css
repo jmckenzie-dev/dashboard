@@ -114,6 +114,10 @@ code, pre {
   color: var(--text-muted);
 }
 
+.status-error {
+  color: var(--accent-red);
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -173,6 +177,11 @@ code, pre {
 .badge-idle {
   background: rgba(128, 128, 128, 0.2);
   color: var(--text-muted);
+}
+
+.badge-error {
+  background: rgba(241, 76, 76, 0.25);
+  color: var(--accent-red);
 }
 
 .badge-mode {

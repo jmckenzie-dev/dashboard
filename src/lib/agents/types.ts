@@ -13,7 +13,8 @@ export type AgentStatus =
   | 'blocked_review'
   | 'complete'
   | 'idle'
-  | 'retry';
+  | 'retry'
+  | 'error';
 
 export type BlockReason = 'permission' | 'question' | 'review';
 

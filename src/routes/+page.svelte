@@ -29,7 +29,8 @@
     | 'blocked_review'
     | 'complete'
     | 'idle'
-    | 'retry',
+    | 'retry'
+    | 'error',
     number
   >;
 
@@ -47,6 +48,7 @@
     complete: 0,
     idle: 0,
     retry: 0,
+    error: 0,
   });
   let expandedId = $state<string | null>(null);
   let expandedSubagents = $state<Record<string, boolean>>({});
@@ -187,6 +189,8 @@
     if (s === 'blocked_review') return 'badge-blocked-review';
     if (s === 'blocked') return 'badge-blocked';
     if (s === 'complete') return 'badge-complete';
+    if (s === 'retry') return 'badge-retry';
+    if (s === 'error') return 'badge-error';
     return 'badge-idle';
   }
 
@@ -198,6 +202,7 @@
     if (s === 'blocked_review') return '🟡';
     if (s === 'blocked') return '🔴';
     if (s === 'complete') return '🟢';
+    if (s === 'error') return '❌';
     return '⚪';
   }
 
@@ -209,6 +214,7 @@
     if (s === 'blocked_review') return 'Blocked (awaiting review)';
     if (s === 'blocked') return 'Blocked';
     if (s === 'complete') return 'Complete';
+    if (s === 'error') return 'Error';
     return 'Idle';
   }
 
@@ -305,6 +311,7 @@
     {#if counts.blocked}<span class="badge badge-blocked">🔴 {counts.blocked} Blocked</span>{/if}
     <span class="badge badge-complete">🟢 {counts.complete} Complete</span>
     <span class="badge badge-idle">⚪ {counts.idle} Idle</span>
+    {#if counts.error}<span class="badge badge-error">❌ {counts.error} Error</span>{/if}
 </section>
 
 <main class="main">
@@ -610,6 +617,10 @@
 
   .card[data-status='complete'] {
     border-left-color: var(--accent-green);
+  }
+
+  .card[data-status='error'] {
+    border-left-color: var(--accent-red);
   }
 
   .card.dimmed {

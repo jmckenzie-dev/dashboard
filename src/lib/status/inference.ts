@@ -44,8 +44,9 @@ export const WORKING_GRACE_MS = 10_000;
 export function analyzeParts(parts: NormalizedPart[]): {
   latestTool: LatestToolInfo | null;
   latestStepReason: string | null;
+  hasError: boolean;
 } {
-  if (parts.length === 0) return { latestTool: null, latestStepReason: null };
+  if (parts.length === 0) return { latestTool: null, latestStepReason: null, hasError: false };
 
   // Newest first by time (stable for equal times).
   const ordered = [...parts].sort((a, b) => b.time - a.time);
@@ -92,6 +93,10 @@ export function analyzeParts(parts: NormalizedPart[]): {
     };
   }
 
+  // Error is scoped to the latest relevant tool state. A historical tool error
+  // must not mask a newer active blocking tool such as `submit_plan`.
+  const hasError = latestTool?.status === 'error';
+
   let latestStepReason: string | null = null;
   for (const p of ordered) {
     if (p.type === 'step-finish' && p.reason) {
@@ -100,7 +105,7 @@ export function analyzeParts(parts: NormalizedPart[]): {
     }
   }
 
-  return { latestTool, latestStepReason };
+  return { latestTool, latestStepReason, hasError };
 }
 
 export interface OpencodeStatusInput {
@@ -110,6 +115,7 @@ export interface OpencodeStatusInput {
   hasPermission: boolean;
   hasQuestion: boolean;
   lastActivityMs: number;
+  hasError?: boolean;
 }
 
 // The authoritative status algorithm (doc §7). Blocking states are checked
@@ -123,6 +129,7 @@ export function inferOpencodeStatus(input: OpencodeStatusInput): AgentStatus {
     hasPermission,
     hasQuestion,
     lastActivityMs,
+    hasError,
   } = input;
 
   const toolName = latestTool?.tool ?? '';
@@ -131,18 +138,29 @@ export function inferOpencodeStatus(input: OpencodeStatusInput): AgentStatus {
   // --- blocking states first (most specific, mutually exclusive) ---
   if (hasPermission) return 'blocked_permission';
   if (hasQuestion) return 'blocked_question';
-  // submit_plan parks on a running tool part; no staleness cutoff (96h reviews).
-  if (toolName === 'submit_plan' && toolActive) return 'blocked_review';
+  // submit_plan/plan_exit park on a running tool part; no staleness cutoff
+  // (96h reviews).
+  if ((toolName === 'submit_plan' || toolName === 'plan_exit') && toolActive) {
+    return 'blocked_review';
+  }
   // Durable fallback for the `question` tool when the live /question endpoint
   // is unavailable or the instance restarted mid-ask.
   if (toolName === 'question' && toolActive) return 'blocked_question';
+
+  // --- current/latest tool error ---
+  if (hasError) return 'error';
 
   // --- retry (folded under `working` in the UI, but distinct in the model) ---
   if (sessionStatus === 'retry') return 'retry';
 
   // --- actively working ---
   if (sessionStatus === 'busy') return 'working';
-  if (toolActive && toolName !== 'submit_plan' && toolName !== 'question') {
+  if (
+    toolActive &&
+    toolName !== 'submit_plan' &&
+    toolName !== 'plan_exit' &&
+    toolName !== 'question'
+  ) {
     return 'working';
   }
 

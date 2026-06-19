@@ -9,6 +9,8 @@ import type {
   NormalizedPart,
 } from '../status/inference';
 import { loadConfig } from '../config';
+import { scanProcesses } from '../process/poller';
+import type { ProcessScanResult } from '../process/poller';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
@@ -63,6 +65,7 @@ interface ParsedPartData {
   latestTool: LatestToolInfo | null;
   latestStepReason: string | null;
   lastPartTime: number | null;
+  hasError: boolean;
 }
 
 // Live-API-only blocking signals, keyed by session id.
@@ -75,6 +78,7 @@ interface BlockingRequests {
 interface InstanceLiveness {
   apiReachable: boolean;
   liveDirectories: Set<string>;
+  liveSessionIds: Set<string>;
 }
 
 interface OpenCodeSQLiteOptions {
@@ -133,7 +137,7 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
     });
   }
 
-  const { latestTool, latestStepReason } = analyzeParts(normalized);
+  const { latestTool, latestStepReason, hasError } = analyzeParts(normalized);
 
   // Chronological pass for message extraction (text/reasoning/tool summaries).
   for (const part of [...parts].reverse()) {
@@ -185,7 +189,8 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
     messages: trimmed,
     latestTool,
     latestStepReason,
-    lastPartTime
+    lastPartTime,
+    hasError,
   };
 }
 
@@ -316,10 +321,14 @@ async function getInstanceLiveness(
   options: OpenCodeAPIOptions,
   apiReachable: boolean,
   statusData: Record<string, OpenCodeSessionStatusResponse>,
+  processScan: ProcessScanResult,
 ): Promise<InstanceLiveness> {
-  if (!apiReachable) return { apiReachable: false, liveDirectories: new Set() };
+  const liveDirectories = new Set(processScan.liveDirectories);
+  const liveSessionIds = new Set(processScan.liveSessionIds);
+  if (!apiReachable) {
+    return { apiReachable: false, liveDirectories, liveSessionIds };
+  }
 
-  const liveDirectories = new Set<string>();
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 1000);
@@ -342,12 +351,65 @@ async function getInstanceLiveness(
   for (const sid of Object.keys(statusData)) {
     const entry = statusData[sid];
     if (entry && (entry.type === 'busy' || entry.type === 'retry')) {
-      // We don't learn the directory from here, but busy ⇒ alive; callers mark
-      // the session alive via statusData membership.
+      liveSessionIds.add(sid);
     }
   }
 
-  return { apiReachable: true, liveDirectories };
+  // A reachable serve instance's /session endpoint is positive liveness for
+  // sessions it currently knows about, including idle-but-live sessions that do
+  // not appear in /session/status.
+  await addLiveSessionsFromServe(apiBase, options, liveDirectories, liveSessionIds);
+
+  // Process-discovered serve ports may include instances other than apiBase.
+  await Promise.all(
+    processScan.servePorts.map((port) =>
+      addLiveSessionsFromServe(
+        `http://127.0.0.1:${port}`,
+        options,
+        liveDirectories,
+        liveSessionIds,
+      ),
+    ),
+  );
+
+  return { apiReachable: true, liveDirectories, liveSessionIds };
+}
+
+async function addLiveSessionsFromServe(
+  apiBase: string,
+  options: OpenCodeAPIOptions,
+  liveDirectories: Set<string>,
+  liveSessionIds: Set<string>,
+): Promise<void> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(`${apiBase}/session`, {
+      signal: controller.signal,
+      headers: options.headers,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return;
+
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const sessions = await res.json() as Array<{
+      id?: string;
+      directory?: string;
+      time?: { updated?: number };
+    }>;
+
+    for (const session of sessions) {
+      if (!session.id) continue;
+      const updated = toEpochMs(session.time?.updated);
+      if (updated && updated < cutoff) continue;
+      liveSessionIds.add(session.id);
+      if (typeof session.directory === 'string' && session.directory) {
+        liveDirectories.add(session.directory);
+      }
+    }
+  } catch {
+    // Best-effort liveness probe.
+  }
 }
 
 function computeInstanceAlive(
@@ -359,6 +421,8 @@ function computeInstanceAlive(
   // Busy/retry ⇒ instance is alive.
   const entry = statusData[sessionId];
   if (entry && (entry.type === 'busy' || entry.type === 'retry')) return true;
+  // /session from a reachable serve instance ⇒ live, even if idle.
+  if (liveness.liveSessionIds.has(sessionId)) return true;
   // Directory matches a reachable instance's `/path` ⇒ alive.
   if (directory && liveness.liveDirectories.has(directory)) return true;
   return false;
@@ -398,6 +462,7 @@ async function getSessionsViaAPI(
       let messages: AgentMessage[] = [];
       let latestTool: LatestToolInfo | null = null;
       let latestStepReason: string | null = null;
+      let hasError = false;
       let currentMode: string | undefined;
 
       if (hasActiveInstance || lastActivityMs < 2 * 60 * 60 * 1000 || index < 25) {
@@ -446,6 +511,7 @@ async function getSessionsViaAPI(
             const analyzed = analyzeParts(normalized);
             latestTool = analyzed.latestTool;
             latestStepReason = analyzed.latestStepReason;
+            hasError = analyzed.hasError;
           }
         } catch (error) {
           console.warn(`OpenCode message fetch failed for ${session.id}:`, error);
@@ -454,6 +520,7 @@ async function getSessionsViaAPI(
 
       const permIds = blocking.permissionsBySession.get(session.id) ?? [];
       const questIds = blocking.questionsBySession.get(session.id) ?? [];
+
       const status = inferOpencodeStatus({
         sessionStatus,
         latestTool,
@@ -461,6 +528,7 @@ async function getSessionsViaAPI(
         hasPermission: permIds.length > 0,
         hasQuestion: questIds.length > 0,
         lastActivityMs,
+        hasError,
       });
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
@@ -507,11 +575,14 @@ async function getSessionsViaSQLite(
     const DatabaseConstructor = await getSQLite();
     const db = new DatabaseConstructor(resolvedDbPath, { readonly: true, fileMustExist: true });
 
+    // Reference-style query: exclude archived + child sessions, no fixed low limit.
+    // Gap §3.5 fix: remove LIMIT 50, add time_archived IS NULL filter.
     const sessions = db.prepare(`
       SELECT id, project_id, parent_id, directory, title, time_created, time_updated
       FROM session
+      WHERE time_archived IS NULL AND parent_id IS NULL
       ORDER BY time_updated DESC
-      LIMIT 50
+      LIMIT 200
     `).all() as OpenCodeSessionRow[];
 
     const result: AgentSession[] = [];
@@ -541,6 +612,7 @@ async function getSessionsViaSQLite(
         hasPermission: permIds.length > 0,
         hasQuestion: questIds.length > 0,
         lastActivityMs,
+        hasError: parsed.hasError,
       });
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
@@ -582,6 +654,8 @@ export async function getOpenCodeSessions(): Promise<AgentSession[]> {
 
   if (!agentConfig.enabled) return [];
 
+  const processScan = scanProcesses();
+
   let apiAvailable = false;
   let options: OpenCodeAPIOptions | null = null;
 
@@ -596,11 +670,15 @@ export async function getOpenCodeSessions(): Promise<AgentSession[]> {
     permissionsBySession: new Map(),
     questionsBySession: new Map(),
   };
-  let liveness: InstanceLiveness = { apiReachable: apiAvailable, liveDirectories: new Set() };
+  let liveness: InstanceLiveness = {
+    apiReachable: apiAvailable,
+    liveDirectories: new Set(processScan.liveDirectories),
+    liveSessionIds: new Set(processScan.liveSessionIds),
+  };
   if (apiAvailable && options && agentConfig.apiBase) {
     statusData = await getSessionStatusData(agentConfig.apiBase, options);
     blocking = await getBlockingRequests(agentConfig.apiBase, options);
-    liveness = await getInstanceLiveness(agentConfig.apiBase, options, apiAvailable, statusData);
+    liveness = await getInstanceLiveness(agentConfig.apiBase, options, apiAvailable, statusData, processScan);
   }
 
   if (agentConfig.dbPath) {
@@ -648,7 +726,11 @@ async function getSessionDirectoryViaAPI(
     permissionsBySession: new Map(),
     questionsBySession: new Map(),
   };
-  const noLiveness: InstanceLiveness = { apiReachable: true, liveDirectories: new Set() };
+  const noLiveness: InstanceLiveness = {
+    apiReachable: true,
+    liveDirectories: new Set(),
+    liveSessionIds: new Set(),
+  };
   const sessions = await getSessionsViaAPI(apiBase, options, emptyBlocking, noLiveness);
   const session = sessions.find(s => s.id === `opencode-${sessionId}`);
   return session?.directory ?? null;

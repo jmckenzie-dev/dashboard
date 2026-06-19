@@ -12,11 +12,12 @@
 - [ ] Auto sort w/blocked at top ordered by longest blocked first, working underneath sorted by longest, then complete sorted by most recent to oldest.
 - [ ] Look into ability to remotely spin up new opencode sessions from http GUI and start new jobs in a new worktree.
 - [ ] Look into ability to register certain projects or create new projects w/the GUI to kick off new feature work.
-- [ ] Implement OpenCode liveness Phase 2 (OS process matching) per docs/opencode-liveness-phase2.md.
 
 # DONE
 
 ## Completed
+- [x] Implement OpenCode liveness Phase 2 (OS process matching) per docs/reference_comparison.md.
+- [x] Implement session status resolution fixes: OS process inventory, error status, hierarchical blocking, multi-port discovery, fixed SQLite query, liveness-based visibility, and queryability API (GET /api/status/diagnose).
 - [x] Initial git commit created (Feb 26, 2025)
 - [x] Update local AGENTS.md with the status of this codebase (complete via initial commit).
 - [x] For subagents, list them nested and indented under their parent session. Collapse them automatically after 1 minute being complete under the parent task

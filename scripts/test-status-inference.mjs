@@ -134,6 +134,22 @@ r = analyzeParts([
 assertEqual(r.latestTool && r.latestTool.tool, 'submit_plan', 'submit_plan is the latest tool');
 assertEqual(r.latestTool && r.latestTool.active, true, 'submit_plan running (no later stop) is active');
 
+// 4b. Older submit_plan error must not mask a newer running submit_plan.
+r = analyzeParts([
+  toolPart('submit_plan', 'error', { callID: 'old-plan', time: 100 }),
+  toolPart('submit_plan', 'running', { callID: 'new-plan', time: 200 }),
+]);
+assertEqual(r.hasError, false, 'older submit_plan error is not current error');
+assertEqual(r.latestTool && r.latestTool.tool, 'submit_plan', 'newer submit_plan is latest tool');
+assertEqual(r.latestTool && r.latestTool.active, true, 'newer submit_plan remains active');
+
+// 4c. Latest tool error is still a current error signal.
+r = analyzeParts([
+  toolPart('bash', 'completed', { callID: 'ok', time: 100 }),
+  toolPart('bash', 'error', { callID: 'bad', time: 200 }),
+]);
+assertEqual(r.hasError, true, 'latest tool error is current error');
+
 console.log('\n--- inferOpencodeStatus: blocking priority & mutual exclusivity ---');
 
 // 5. Permission present -> blocked_permission (overrides everything).
@@ -196,12 +212,67 @@ assertEqual(run({
   hasPermission: false, hasQuestion: false, lastActivityMs: COMPLETE_FRESH_MS + 60_000,
 }), 'idle', 'stale running tool + aged -> idle (not working, not blocked)');
 
+// --- error status detection ---
+// 14. hasError = true -> error (even with busy status).
+assertEqual(run({
+  sessionStatus: 'busy', latestTool: null, latestStepReason: null,
+  hasPermission: false, hasQuestion: false, lastActivityMs: 5_000, hasError: true,
+}), 'error', 'hasError beats busy -> error');
+
+// 15. hasError = true with permission -> error (error checked before blocking).
+assertEqual(run({
+  sessionStatus: null, latestTool: null, latestStepReason: null,
+  hasPermission: true, hasQuestion: false, lastActivityMs: 5_000, hasError: true,
+}), 'blocked_permission', 'permission beats hasError -> blocked_permission');
+
+// 16. Active submit_plan beats historical/current hasError when both are present.
+assertEqual(run({
+  sessionStatus: null,
+  latestTool: { ...toolPart('submit_plan', 'running', { callID: 'p2', time: 1 }), active: true },
+  latestStepReason: null,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: 96 * 60 * 60 * 1000,
+  hasError: true,
+}), 'blocked_review', 'active submit_plan beats hasError -> blocked_review');
+
+// 17. plan_exit active -> blocked_review (legacy/alternate plan review tool).
+assertEqual(run({
+  sessionStatus: null,
+  latestTool: { ...toolPart('plan_exit', 'running', { callID: 'px', time: 1 }), active: true },
+  latestStepReason: null,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: 60_000,
+}), 'blocked_review', 'plan_exit running -> blocked_review');
+
+// 18. Older submit_plan error + newer running submit_plan reproduces real bug.
+const mixedSubmitPlan = analyzeParts([
+  toolPart('submit_plan', 'error', { callID: 'old-submit-plan', time: 100 }),
+  toolPart('submit_plan', 'running', { callID: 'new-submit-plan', time: 200 }),
+]);
+assertEqual(run({
+  sessionStatus: null,
+  latestTool: mixedSubmitPlan.latestTool,
+  latestStepReason: mixedSubmitPlan.latestStepReason,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: 16 * 60 * 1000,
+  hasError: mixedSubmitPlan.hasError,
+}), 'blocked_review', 'older submit_plan error + newer running submit_plan -> blocked_review');
+
+// 19. hasError = false, no error -> normal flow.
+assertEqual(run({
+  sessionStatus: null, latestTool: null, latestStepReason: 'stop',
+  hasPermission: false, hasQuestion: false, lastActivityMs: 60_000, hasError: false,
+}), 'complete', 'hasError=false does not affect non-error status');
+
 console.log('\n--- mutual exclusivity / priority property sweep ---');
 const baseInput = {
   sessionStatus: null, latestTool: null, latestStepReason: null,
   hasPermission: false, hasQuestion: false, lastActivityMs: 1000,
 };
-const allStatuses = ['working', 'blocked', 'blocked_permission', 'blocked_question', 'blocked_review', 'complete', 'idle', 'retry'];
+const allStatuses = ['working', 'blocked', 'blocked_permission', 'blocked_question', 'blocked_review', 'complete', 'idle', 'retry', 'error'];
 for (const s of allStatuses) {
   assertTrue(typeof run({ ...baseInput }) === 'string', `returns a string for baseline`);
 }

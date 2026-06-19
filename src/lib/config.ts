@@ -32,7 +32,7 @@ const DEFAULT_CONFIG: DashboardConfig = {
     summaryPrompt: 'Summarize this AI agent\'s current task in 5-8 words. Be specific and concise. Only output the summary, nothing else.'
   },
   polling: {
-    intervalMs: 500
+    intervalMs: 3000
   },
   notifications: {
     blocked: {
