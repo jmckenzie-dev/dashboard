@@ -6,13 +6,16 @@ export const load: PageServerLoad = async () => {
   const sessions = await getAllSessions();
   const counts = countStatuses(sessions);
   
+  // On initial SSR load, generate summaries for all sessions. Subsequent
+  // poll ticks will only refresh summaries for active (non-idle/complete)
+  // sessions via the smarter generateSummary caching.
   const sessionsWithSummaries = await Promise.all(
     sessions.map(async (session) => ({
       id: session.id,
       parentId: session.parentId,
       type: session.type,
       name: session.name,
-      summary: await generateSummary(session.id, session.messages),
+      summary: await generateSummary(session.id, session.messages, false, session.status),
       status: session.status,
       project: session.project,
       directory: session.directory,

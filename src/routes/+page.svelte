@@ -55,8 +55,7 @@
   let inputText = $state<Record<string, string>>({});
   let sending = $state<Record<string, boolean>>({});
   let resolving = $state<Record<string, boolean>>({});
-  let pollTimer = $state<ReturnType<typeof setInterval> | null>(null);
-  let pollInFlight = $state(false);
+  let eventSource = $state<EventSource | null>(null);
 
   function sortByLastActivityDesc(a: Session, b: Session): number {
     return new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime();
@@ -109,12 +108,6 @@
     expandedSubagents[parentId] = !subagentsExpanded(parentId);
   }
 
-  function getPollIntervalMs(): number {
-    const raw = data.config?.polling?.intervalMs;
-    if (typeof raw !== 'number' || Number.isNaN(raw)) return 500;
-    return Math.min(10000, Math.max(100, raw));
-  }
-
   $effect(() => {
     sessions = data.sessions as Session[];
     counts = data.counts as Counts;
@@ -124,6 +117,15 @@
     const tree = buildSessionTree(sessions);
     rootSessions = tree.roots;
     childrenByParentId = tree.children;
+
+    // Prune stale state entries for sessions that no longer exist.
+    const activeIds = new Set(sessions.map((s) => s.id));
+    for (const key of Object.keys(expandedSubagents)) {
+      if (!activeIds.has(key)) delete expandedSubagents[key];
+    }
+    for (const key of Object.keys(inputText)) {
+      if (!activeIds.has(key)) delete inputText[key];
+    }
 
     for (const parentId of Object.keys(tree.children)) {
       if (!(parentId in expandedSubagents)) {
@@ -137,26 +139,35 @@
   });
 
   onMount(() => {
-    pollTimer = setInterval(async () => {
-      if (pollInFlight) return;
-      pollInFlight = true;
+    // Use SSE for real-time updates instead of polling /api/agents every N ms.
+    // The SSE endpoint pushes session data at the configured interval.
+    const es = new EventSource('/api/events');
+    eventSource = es;
 
+    es.addEventListener('update', (e: MessageEvent) => {
       try {
-        const response = await fetch('/api/agents');
-        if (!response.ok) return;
-        const payload = await response.json();
+        const payload = JSON.parse(e.data);
         sessions = payload.sessions as Session[];
         counts = payload.counts as Counts;
       } catch (error) {
-        console.error('poll failed', error);
-      } finally {
-        pollInFlight = false;
+        console.error('SSE parse error', error);
       }
-    }, getPollIntervalMs());
+    });
+
+    es.addEventListener('connected', () => {
+      // Connection established — no action needed.
+    });
+
+    es.onerror = () => {
+      console.error('SSE connection error — will auto-reconnect');
+    };
   });
 
   onDestroy(() => {
-    if (pollTimer) clearInterval(pollTimer);
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
   });
 
   function toggleExpand(id: string) {

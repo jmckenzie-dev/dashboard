@@ -13,6 +13,8 @@ import { getClaudeSessions, sendClaudeMessage } from './claude';
 import { getCodexSessions, sendCodexMessage } from './codex';
 import { getGeminiSessions, sendGeminiMessage } from './gemini';
 
+// LRU cache for previous statuses — bounded to prevent unbounded memory growth.
+const MAX_TRACKED_SESSIONS = 200;
 const previousStatus = new Map<string, AgentStatus>();
 const transitionCallbacks: Array<(transition: StatusTransition) => void> = [];
 
@@ -26,8 +28,10 @@ export function onStatusTransition(callback: (transition: StatusTransition) => v
 
 function checkTransitions(sessions: AgentSession[]): StatusTransition[] {
   const transitions: StatusTransition[] = [];
+  const seen = new Set<string>();
   
   for (const session of sessions) {
+    seen.add(session.id);
     const prev = previousStatus.get(session.id);
     
     if (prev && prev !== session.status) {
@@ -50,6 +54,16 @@ function checkTransitions(sessions: AgentSession[]): StatusTransition[] {
     }
     
     previousStatus.set(session.id, session.status);
+  }
+  
+  // Evict stale entries when the map exceeds the maximum size.
+  if (previousStatus.size > MAX_TRACKED_SESSIONS) {
+    for (const key of previousStatus.keys()) {
+      if (!seen.has(key)) {
+        previousStatus.delete(key);
+        if (previousStatus.size <= MAX_TRACKED_SESSIONS) break;
+      }
+    }
   }
   
   return transitions;

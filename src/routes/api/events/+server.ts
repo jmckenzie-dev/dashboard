@@ -25,12 +25,25 @@ export const GET: RequestHandler = async (event) => {
           const sessions = await getAllSessions();
           const counts = countStatuses(sessions);
           
+          // Only generate summaries for active sessions; idle/complete rely on
+          // the existing cache (TTL 10-30 min) to avoid LLM calls every tick.
+          // Messages are truncated server-side (last 5, 220 chars each).
           const sessionsWithSummaries = await Promise.all(
-            sessions.slice(0, 20).map(async (session) => ({
-              ...session,
-              summary: await generateSummary(session.id, session.messages),
-              lastActivity: session.lastActivity.toISOString()
-            }))
+            sessions.slice(0, 20).map(async (session) => {
+              const needsSummary = session.status !== 'idle' && session.status !== 'complete';
+              return {
+                ...session,
+                summary: needsSummary
+                  ? await generateSummary(session.id, session.messages, false, session.status)
+                  : session.summary,
+                messages: session.messages.slice(-5).map((m) => ({
+                  ...m,
+                  content: m.content.slice(0, 220),
+                  timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp
+                })),
+                lastActivity: session.lastActivity.toISOString()
+              };
+            })
           );
           
           await sendEvent('update', { sessions: sessionsWithSummaries, counts });
