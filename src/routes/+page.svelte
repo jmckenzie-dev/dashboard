@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PageData } from './$types';
-  import { compareSessions, type AgentStatus } from '$lib/agents/types';
+  import { compareSessions, isBlocked, type AgentStatus } from '$lib/agents/types';
   import { onDestroy, onMount } from 'svelte';
 
   type Session = {
@@ -16,6 +16,7 @@
     messages: Array<{ id: string; role: string; content: string; timestamp: string }>;
     canSendInput: boolean;
     mode?: string;
+    phase?: string;
     blockReason?: 'permission' | 'question' | 'review' | null;
     instanceAlive?: boolean;
     blockingRequestIds?: string[];
@@ -179,10 +180,6 @@
     return d.toLocaleDateString();
   }
 
-  function isBlockedStatus(status: AgentStatus): boolean {
-    return status === 'blocked' || status.startsWith('blocked_');
-  }
-
   // `retry` is folded under `working` visually (blue border) with a sub-label.
   function displayStatus(status: AgentStatus): AgentStatus {
     return status === 'retry' ? 'working' : status;
@@ -244,6 +241,23 @@
     if (type === 'codex') return '💻';
     if (type === 'gemini') return '✨';
     return '🤖';
+  }
+
+  function phaseEmoji(phase: string | undefined): string {
+    if (phase === 'reasoning') return '🧠';
+    if (phase === 'using_tool') return '🔧';
+    if (phase === 'generating') return '💬';
+    if (phase === 'blocked') return '⚠️';
+    return '';
+  }
+
+  function showPhaseIcon(session: Session): boolean {
+    return (session.status === 'working' || session.status === 'retry') &&
+      !!session.phase && session.phase !== 'idle';
+  }
+
+  function showBlockedIcon(session: Session): boolean {
+    return isBlocked(session.status);
   }
 
   async function sendMessage(sessionId: string) {
@@ -334,9 +348,17 @@
           aria-expanded={expandedId === session.id}
         >
           <span class="triangle">{expandedId === session.id ? '▾' : '▸'}</span>
-          <span class="icon">{agentIcon(session.type)}</span>
+          <span class="icon">
+            {#if showPhaseIcon(session)}
+              {phaseEmoji(session.phase)}
+            {:else if showBlockedIcon(session)}
+              ⚠️
+            {:else}
+              {agentIcon(session.type)}
+            {/if}
+          </span>
           <span class="title-group">
-            <span class="title-line">{session.type} - {session.name}</span>
+            <span class="title-line">{session.name}</span>
             <span class="summary">{session.summary || 'No summary yet'}</span>
           </span>
           <span class="meta">
@@ -435,9 +457,17 @@
                     aria-expanded={expandedId === child.id}
                   >
                     <span class="triangle">{expandedId === child.id ? '▾' : '▸'}</span>
-                    <span class="icon">{agentIcon(child.type)}</span>
+                    <span class="icon">
+                      {#if showPhaseIcon(child)}
+                        {phaseEmoji(child.phase)}
+                      {:else if showBlockedIcon(child)}
+                        ⚠️
+                      {:else}
+                        {agentIcon(child.type)}
+                      {/if}
+                    </span>
                     <span class="title-group">
-                      <span class="title-line">{child.type} - {child.name}</span>
+                      <span class="title-line">{child.name}</span>
                       <span class="summary">{child.summary || 'No summary yet'}</span>
                     </span>
                     <span class="meta">

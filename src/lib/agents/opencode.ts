@@ -3,6 +3,7 @@ import { blockReasonOf } from './types';
 import {
   analyzeParts,
   inferOpencodeStatus,
+  inferPhase,
 } from '../status/inference';
 import type {
   LatestToolInfo,
@@ -66,6 +67,8 @@ interface ParsedPartData {
   latestStepReason: string | null;
   lastPartTime: number | null;
   hasError: boolean;
+  latestPartType: string | null;
+  latestPartIsActiveTool: boolean;
 }
 
 // Live-API-only blocking signals, keyed by session id.
@@ -137,7 +140,7 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
     });
   }
 
-  const { latestTool, latestStepReason, hasError } = analyzeParts(normalized);
+  const { latestTool, latestStepReason, hasError, latestPartType, latestPartIsActiveTool } = analyzeParts(normalized);
 
   // Chronological pass for message extraction (text/reasoning/tool summaries).
   for (const part of [...parts].reverse()) {
@@ -191,6 +194,8 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
     latestStepReason,
     lastPartTime,
     hasError,
+    latestPartType,
+    latestPartIsActiveTool,
   };
 }
 
@@ -463,6 +468,8 @@ async function getSessionsViaAPI(
       let latestTool: LatestToolInfo | null = null;
       let latestStepReason: string | null = null;
       let hasError = false;
+      let latestPartType: string | null = null;
+      let latestPartIsActiveTool = false;
       let currentMode: string | undefined;
 
       if (hasActiveInstance || lastActivityMs < 2 * 60 * 60 * 1000 || index < 25) {
@@ -512,6 +519,8 @@ async function getSessionsViaAPI(
             latestTool = analyzed.latestTool;
             latestStepReason = analyzed.latestStepReason;
             hasError = analyzed.hasError;
+            latestPartType = analyzed.latestPartType;
+            latestPartIsActiveTool = analyzed.latestPartIsActiveTool;
           }
         } catch (error) {
           console.warn(`OpenCode message fetch failed for ${session.id}:`, error);
@@ -530,6 +539,7 @@ async function getSessionsViaAPI(
         lastActivityMs,
         hasError,
       });
+      const phase = inferPhase(status, latestPartType, latestPartIsActiveTool, latestTool);
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
         ? permIds
@@ -545,6 +555,7 @@ async function getSessionsViaAPI(
         name: session.title || 'Untitled Session',
         summary: '',
         status,
+        phase,
         directory: session.directory,
         lastActivity,
         messages,
@@ -614,6 +625,7 @@ async function getSessionsViaSQLite(
         lastActivityMs,
         hasError: parsed.hasError,
       });
+      const phase = inferPhase(status, parsed.latestPartType, parsed.latestPartIsActiveTool, parsed.latestTool);
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
         ? permIds
@@ -629,6 +641,7 @@ async function getSessionsViaSQLite(
         name: session.title || 'Untitled Session',
         summary: '',
         status,
+        phase,
         directory: session.directory,
         lastActivity,
         messages: parsed.messages,

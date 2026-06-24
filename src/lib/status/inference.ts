@@ -4,7 +4,11 @@
 // plain `node`. opencode.ts re-imports these — there is exactly one source of
 // truth for the algorithm. See docs/opencode-session-status.md §7.
 
-import type { AgentStatus } from '../agents/types';
+import { isBlocked } from '../agents/types';
+import type { AgentStatus, AgentPhase } from '../agents/types';
+// Note: isBlocked is a non-type import used at runtime by inferPhase. This is
+// fine — it is a pure function that does not pull in side-effects, so the
+// "compile under plain node" property of this module is preserved.
 
 // `/session/status` entry type (v1). `idle` is computed by absence on the wire,
 // but inference accepts it explicitly for completeness.
@@ -45,11 +49,34 @@ export function analyzeParts(parts: NormalizedPart[]): {
   latestTool: LatestToolInfo | null;
   latestStepReason: string | null;
   hasError: boolean;
+  latestPartType: string | null;
+  latestPartIsActiveTool: boolean;
 } {
-  if (parts.length === 0) return { latestTool: null, latestStepReason: null, hasError: false };
+  if (parts.length === 0) return { latestTool: null, latestStepReason: null, hasError: false, latestPartType: null, latestPartIsActiveTool: false };
 
   // Newest first by time (stable for equal times).
   const ordered = [...parts].sort((a, b) => b.time - a.time);
+
+  // Most recent part of any type (for phase inference).
+  // ordered is sorted DESC by time. Within equal-time groups, the API path
+  // builds parts in forward chronological order (stable-sort preserved), so
+  // the last element in the max-time group is the most recent part. The SQLite
+  // path uses ORDER BY time_created DESC; within equal timestamps ordering is
+  // undefined, so the forward walk is still the best heuristic.
+  let latestPartType: string | null = null;
+  let latestPartIsActiveTool: boolean = false;
+  if (ordered.length > 0) {
+    const maxTime = ordered[0].time;
+    // Walk forward through the max-time prefix to find its last element.
+    let end = 0;
+    while (end < ordered.length && ordered[end].time === maxTime) {
+      end++;
+    }
+    const latestOverall = ordered[end - 1];
+    latestPartType = latestOverall.type;
+    latestPartIsActiveTool = latestOverall.type === 'tool'
+      && (latestOverall.status === 'pending' || latestOverall.status === 'running');
+  }
 
   // Most recent natural-stop boundary (reason === 'stop').
   let lastStopTime = 0;
@@ -105,7 +132,7 @@ export function analyzeParts(parts: NormalizedPart[]): {
     }
   }
 
-  return { latestTool, latestStepReason, hasError };
+  return { latestTool, latestStepReason, hasError, latestPartType, latestPartIsActiveTool };
 }
 
 export interface OpencodeStatusInput {
@@ -171,5 +198,43 @@ export function inferOpencodeStatus(input: OpencodeStatusInput): AgentStatus {
 
   // --- ambiguous stale activity ---
   if (lastActivityMs < WORKING_GRACE_MS) return 'working';
+  return 'idle';
+}
+
+/**
+ * Infer the current phase of an agent session based on status and the most
+ * recent part type.
+ *
+ * Order matters: blocked/error statuses are authoritative; otherwise the latest
+ * part type determines the phase. Reasoning → 🧠, active tool execution → 🔧,
+ * text generation → 💬, blocked/idle → nothing.
+ */
+export function inferPhase(
+  status: AgentStatus,
+  latestPartType: string | null,
+  latestPartIsActiveTool: boolean,
+  latestTool: LatestToolInfo | null,
+): AgentPhase {
+  // Blocked/error statuses are authoritative phase signals.
+  // Note: error maps to blocked phase for future UI use (e.g., showing ⚠️
+  // alongside ❌). Currently the frontend does not consume phase for error
+  // sessions — it shows ❌ via the status dot instead.
+  if (isBlocked(status) || status === 'error') return 'blocked';
+  if (status === 'complete' || status === 'idle') return 'idle';
+
+  // For working/retry sessions, use the latest part type.
+  if (latestPartType === 'reasoning') return 'reasoning';
+  if (latestPartType === 'text') return 'generating';
+
+  // Active tool execution (the latest part is a tool that's in flight).
+  const toolName = latestTool?.tool ?? '';
+  const isBlockingTool = toolName === 'submit_plan' || toolName === 'plan_exit' || toolName === 'question';
+  if (latestPartIsActiveTool && !isBlockingTool) return 'using_tool';
+
+  // Fallback: check if latestTool is active (catches cases where a tool part is
+  // still running but not the absolute latest part due to ordering quirks).
+  if (latestTool?.active && !isBlockingTool) return 'using_tool';
+
+  // Default for working with no clear phase signal.
   return 'idle';
 }

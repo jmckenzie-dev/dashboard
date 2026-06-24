@@ -16,6 +16,8 @@ export type AgentStatus =
   | 'retry'
   | 'error';
 
+export type AgentPhase = 'reasoning' | 'generating' | 'using_tool' | 'blocked' | 'idle';
+
 export type BlockReason = 'permission' | 'question' | 'review';
 
 export function isBlocked(status: AgentStatus): boolean {
@@ -56,6 +58,7 @@ export interface AgentSession {
   canSendInput: boolean;
   isActiveInstance?: boolean;
   mode?: string;
+  phase?: AgentPhase;
   // Why a session is blocked (only set for blocked_* statuses).
   blockReason?: BlockReason | null;
   // True when we have positive evidence the owning instance is reachable
