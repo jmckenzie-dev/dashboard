@@ -131,3 +131,39 @@ export interface StatusTransition {
   toStatus: AgentStatus;
   timestamp: Date;
 }
+
+export function getStatusRank(status: AgentStatus): number {
+  switch (status) {
+    case 'error':
+      return 1;
+    case 'blocked_permission':
+    case 'blocked_question':
+    case 'blocked':
+      return 2;
+    case 'blocked_review':
+      return 3;
+    case 'working':
+    case 'retry':
+      return 4;
+    case 'complete':
+      return 5;
+    case 'idle':
+    default:
+      return 6;
+  }
+}
+
+export function compareSessions(
+  a: { status: AgentStatus; lastActivity: Date | string },
+  b: { status: AgentStatus; lastActivity: Date | string }
+): number {
+  const rankA = getStatusRank(a.status);
+  const rankB = getStatusRank(b.status);
+  if (rankA !== rankB) {
+    return rankA - rankB;
+  }
+  const timeA = a.lastActivity instanceof Date ? a.lastActivity.getTime() : new Date(a.lastActivity).getTime();
+  const timeB = b.lastActivity instanceof Date ? b.lastActivity.getTime() : new Date(b.lastActivity).getTime();
+  return timeB - timeA;
+}
+

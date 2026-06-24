@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PageData } from './$types';
-  import type { AgentStatus } from '$lib/agents/types';
+  import { compareSessions, type AgentStatus } from '$lib/agents/types';
   import { onDestroy, onMount } from 'svelte';
 
   type Session = {
@@ -57,10 +57,6 @@
   let resolving = $state<Record<string, boolean>>({});
   let eventSource = $state<EventSource | null>(null);
 
-  function sortByLastActivityDesc(a: Session, b: Session): number {
-    return new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime();
-  }
-
   function buildSessionTree(allSessions: Session[]): {
     roots: Session[];
     children: Record<string, Session[]>;
@@ -80,9 +76,9 @@
       roots.push(session);
     }
 
-    roots.sort(sortByLastActivityDesc);
+    roots.sort(compareSessions);
     for (const parentId of Object.keys(children)) {
-      children[parentId].sort(sortByLastActivityDesc);
+      children[parentId].sort(compareSessions);
     }
 
     return { roots, children };

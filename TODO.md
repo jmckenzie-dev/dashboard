@@ -16,6 +16,7 @@
 # DONE
 
 ## Completed
+- [x] Group dashboard sessions by status (Error, Blocked, Working, Complete, Idle) and sort by updated descending
 - [x] Implement OpenCode liveness Phase 2 (OS process matching) per docs/reference_comparison.md.
 - [x] Implement session status resolution fixes: OS process inventory, error status, hierarchical blocking, multi-port discovery, fixed SQLite query, liveness-based visibility, and queryability API (GET /api/status/diagnose).
 - [x] Initial git commit created (Feb 26, 2025)

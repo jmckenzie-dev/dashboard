@@ -1,5 +1,5 @@
 import type { AgentSession, AgentType, AgentStatus, StatusTransition, BlockReason } from './types';
-import { isBlocked } from './types';
+import { isBlocked, compareSessions } from './types';
 import {
   getOpenCodeSessions,
   sendOpenCodeMessage,
@@ -172,7 +172,7 @@ export async function getAllSessions(): Promise<AgentSession[]> {
     return false;
   });
   
-  return activeSessions.sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime());
+  return activeSessions.sort(compareSessions);
 }
 
 export async function getSessionById(id: string): Promise<AgentSession | null> {
