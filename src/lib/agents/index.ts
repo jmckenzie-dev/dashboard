@@ -18,6 +18,42 @@ const MAX_TRACKED_SESSIONS = 200;
 const previousStatus = new Map<string, AgentStatus>();
 const transitionCallbacks: Array<(transition: StatusTransition) => void> = [];
 
+function isVisibleOpenCodeSession(session: AgentSession): boolean {
+  const reason = session.visibilityReason ?? session.livenessReason ?? null;
+
+  if (reason === 'hidden_stale') return false;
+  if (reason) return true;
+
+  if (session.instanceAlive === true) return true;
+  if (session.pid) return true;
+  if (session.isActiveInstance) return true;
+  if ((session.blockingRequestIds?.length ?? 0) > 0) return true;
+  if (isBlocked(session.status)) return true;
+  if (session.status === 'working' || session.status === 'retry') return true;
+
+  return false;
+}
+
+function isVisibleGenericSession(
+  session: AgentSession,
+  recentWindow: number,
+  blockedWindow: number,
+  completeWindow: number,
+): boolean {
+  const updated = session.lastActivity.getTime();
+
+  if (session.instanceAlive === true) return true;
+  if (session.pid) return true;
+  if (session.isActiveInstance) return true;
+  if (updated > recentWindow) return true;
+  if (session.status === 'retry' && updated > blockedWindow) return true;
+  if (isBlocked(session.status) && updated > blockedWindow) return true;
+  if (session.status === 'complete' && updated > completeWindow) return true;
+  if (session.status === 'error' && updated > blockedWindow) return true;
+
+  return false;
+}
+
 export function onStatusTransition(callback: (transition: StatusTransition) => void): () => void {
   transitionCallbacks.push(callback);
   return () => {
@@ -155,21 +191,10 @@ export async function getAllSessions(): Promise<AgentSession[]> {
   const blockedWindow = now - 2 * 60 * 60 * 1000;
   const completeWindow = now - 30 * 60 * 1000;
 
-  const activeSessions = all.filter(session => {
-    const updated = session.lastActivity.getTime();
-    // Gap §3.4 fix: keep sessions backed by a live process.
-    // Process-backed sessions should be visible regardless of recency.
-    if (session.instanceAlive === true) return true;
-    if (session.pid) return true;
-    if (session.isActiveInstance) return true;
-    if (updated > recentWindow) return true;
-    if (session.status === 'retry' && updated > blockedWindow) return true;
-    // Blocked sessions are actionable — keep them visible for a long window.
-    if (isBlocked(session.status) && updated > blockedWindow) return true;
-    if (session.status === 'complete' && updated > completeWindow) return true;
-    // Error sessions: keep visible for a longer window so users can see them.
-    if (session.status === 'error' && updated > blockedWindow) return true;
-    return false;
+  const activeSessions = all.filter((session) => {
+    if (session.type === 'opencode') return isVisibleOpenCodeSession(session);
+
+    return isVisibleGenericSession(session, recentWindow, blockedWindow, completeWindow);
   });
   
   return activeSessions.sort(compareSessions);

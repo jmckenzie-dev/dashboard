@@ -20,6 +20,15 @@ export type AgentPhase = 'reasoning' | 'generating' | 'using_tool' | 'blocked' |
 
 export type BlockReason = 'permission' | 'question' | 'review';
 
+export type OpenCodeSessionReason =
+  | 'status_map'
+  | 'blocking_request'
+  | 'active_tool'
+  | 'process_session_id'
+  | 'cwd_allocated'
+  | 'recent_active_fallback'
+  | 'hidden_stale';
+
 export function isBlocked(status: AgentStatus): boolean {
   return (
     status === 'blocked' ||
@@ -62,9 +71,11 @@ export interface AgentSession {
   // Why a session is blocked (only set for blocked_* statuses).
   blockReason?: BlockReason | null;
   // True when we have positive evidence the owning instance is reachable
-  // (in the busy status map, or its directory matches a live `/path` probe).
-  // Undefined when liveness is unknown (see docs/opencode-liveness-phase2.md).
+  // (direct status/blocking/tool/process signal, or bounded cwd allocation).
+  // Undefined when liveness is unknown.
   instanceAlive?: boolean;
+  livenessReason?: OpenCodeSessionReason;
+  visibilityReason?: OpenCodeSessionReason;
   // OpenCode request IDs backing a block (per_* / que_*), so the UI can act.
   blockingRequestIds?: string[];
 }
@@ -169,4 +180,3 @@ export function compareSessions(
   const timeB = b.lastActivity instanceof Date ? b.lastActivity.getTime() : new Date(b.lastActivity).getTime();
   return timeB - timeA;
 }
-

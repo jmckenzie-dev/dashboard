@@ -16,23 +16,13 @@ import {
   countStatuses,
   blockedTotal,
 } from '$lib/agents';
+import { getOpenCodeSessions } from '$lib/agents/opencode';
 import { scanProcesses } from '$lib/process/poller';
 import { isBlocked } from '$lib/agents/types';
+import type { AgentSession } from '$lib/agents/types';
 
-export const GET: RequestHandler = async (event) => {
-  const config = await loadConfig();
-
-  if (config.auth.passwordHash && !await checkAuth(event)) {
-    return requireAuth();
-  }
-
-  const processScan = scanProcesses();
-
-  const sessions = await getAllSessions();
-  const counts = countStatuses(sessions);
-
-  // Detailed session diagnostics
-  const sessionDetails = sessions.map((s) => ({
+function describeSession(s: AgentSession, visible: boolean) {
+  return {
     id: s.id,
     parentId: s.parentId ?? null,
     type: s.type,
@@ -44,13 +34,36 @@ export const GET: RequestHandler = async (event) => {
     project: s.project ?? null,
     pid: s.pid ?? null,
     isActiveInstance: s.isActiveInstance ?? false,
-    instanceAlive: s.instanceAlive ?? false,
+    instanceAlive: s.instanceAlive ?? null,
+    livenessReason: s.livenessReason ?? null,
+    visibilityReason: s.visibilityReason ?? null,
+    visible,
     canSendInput: s.canSendInput,
     lastActivity: s.lastActivity.toISOString(),
     lastActivityAgeMs: Date.now() - s.lastActivity.getTime(),
     messageCount: s.messages.length,
     blockingRequestIds: s.blockingRequestIds ?? [],
-  }));
+  };
+}
+
+export const GET: RequestHandler = async (event) => {
+  const config = await loadConfig();
+
+  if (config.auth.passwordHash && !await checkAuth(event)) {
+    return requireAuth();
+  }
+
+  const processScan = scanProcesses();
+
+  const sessions = await getAllSessions();
+  const opencodeCandidates = await getOpenCodeSessions({ includeHidden: true });
+  const visibleSessionIds = new Set(sessions.map((s) => s.id));
+  const hiddenOpenCodeSessions = opencodeCandidates.filter((s) => !visibleSessionIds.has(s.id));
+  const counts = countStatuses(sessions);
+
+  // Detailed session diagnostics
+  const sessionDetails = sessions.map((s) => describeSession(s, true));
+  const hiddenSessionDetails = hiddenOpenCodeSessions.map((s) => describeSession(s, false));
 
   // Build the parent→child tree for analysis
   const byId = new Map(sessions.map((s) => [s.id, s]));
@@ -75,10 +88,35 @@ export const GET: RequestHandler = async (event) => {
       sessionId: p.sessionId,
       port: p.port ?? null,
       isServe: p.isServe,
+      cwdRead: p.cwdRead ? {
+        pid: p.cwdRead.pid,
+        status: p.cwdRead.status,
+        cwd: p.cwdRead.cwd,
+        method: p.cwdRead.method,
+        error: p.cwdRead.error ?? null,
+      } : null,
     })),
     servePorts: processScan.servePorts,
     liveDirectories: processScan.liveDirectories,
     liveSessionIds: processScan.liveSessionIds,
+    directSessionIds: processScan.directSessionIds,
+    directoryProcessCounts: processScan.directoryProcessCounts,
+    cwdReadDiagnostics: processScan.cwdReadDiagnostics.map((cwdRead) => ({
+      pid: cwdRead.pid,
+      status: cwdRead.status,
+      cwd: cwdRead.cwd,
+      method: cwdRead.method,
+      error: cwdRead.error ?? null,
+    })),
+    cwdReadErrors: processScan.cwdReadDiagnostics
+      .filter((cwdRead) => cwdRead.status !== 'ok')
+      .map((cwdRead) => ({
+        pid: cwdRead.pid,
+        status: cwdRead.status,
+        cwd: cwdRead.cwd,
+        method: cwdRead.method,
+        error: cwdRead.error ?? null,
+      })),
     scanSucceeded: processScan.scanSucceeded,
   };
 
@@ -116,6 +154,7 @@ export const GET: RequestHandler = async (event) => {
     sessionsWithErrorStatus: sessions.filter((s) => s.status === 'error').length,
     blockedSessions: sessions.filter((s) => isBlocked(s.status)).length,
     visibleSessionCount: sessions.length,
+    hiddenOpenCodeSessionCount: hiddenOpenCodeSessions.length,
     allStatusCounts: counts,
     blockedTotal: blockedTotal(counts),
   };
@@ -130,9 +169,23 @@ export const GET: RequestHandler = async (event) => {
     gap_analysis: gapAnalysis,
     session_tree: parentChildEntries,
     sessions: sessionDetails,
+    hidden_sessions: hiddenSessionDetails,
     processes: processInfo,
     agent_config: agentConfig,
+    opencode_visibility: {
+      visible_reasons: [
+        'status_map',
+        'blocking_request',
+        'active_tool',
+        'process_session_id',
+        'cwd_allocated',
+        'recent_active_fallback',
+      ],
+      hidden_reason: 'hidden_stale',
+      unknown_liveness_value: null,
+    },
     visibility_windows: {
+      applies_to: 'generic_agents_only',
       recent_window_seconds: 600,
       blocked_window_seconds: 7200,
       complete_window_seconds: 1800,

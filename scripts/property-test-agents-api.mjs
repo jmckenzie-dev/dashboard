@@ -48,7 +48,7 @@ async function main() {
 
   const statuses = [
     'working', 'blocked', 'blocked_permission', 'blocked_question',
-    'blocked_review', 'complete', 'idle', 'retry'
+    'blocked_review', 'complete', 'idle', 'retry', 'error'
   ];
   const counts = Object.fromEntries(statuses.map((status) => [status, 0]));
   const now = Date.now();

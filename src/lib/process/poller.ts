@@ -3,12 +3,24 @@
 // Pure OS-level module; no SQLite dependency. Callers in opencode.ts handle DB mapping.
 
 import { execSync } from 'node:child_process';
-import { existsSync, readlinkSync } from 'node:fs';
+import { readlinkSync } from 'node:fs';
 import { platform } from 'node:os';
+import { basename } from 'node:path';
+
+export type CwdReadStatus = 'ok' | 'not_found' | 'permission_denied' | 'timeout' | 'unknown';
+
+export interface CwdReadDiagnostic {
+  pid: number;
+  status: CwdReadStatus;
+  cwd: string | null;
+  method: 'proc' | 'lsof';
+  error?: string;
+}
 
 export interface OpenCodeProcess {
   pid: number;
   cwd: string | null;
+  cwdRead?: CwdReadDiagnostic;
   sessionId: string | null;   // from -s flag, or null for flagless TUI
   port?: number;               // only for opencode serve processes
   isServe: boolean;
@@ -17,31 +29,151 @@ export interface OpenCodeProcess {
 export interface ProcessScanResult {
   processes: OpenCodeProcess[];
   servePorts: number[];
-  /** Directories known to back live processes */
+  /** Directories observed as process cwd values; weak signal only */
   liveDirectories: string[];
-  /** Session IDs explicitly known from process args or live serve APIs */
+  /** Backward-compatible alias for directSessionIds */
   liveSessionIds: string[];
+  /** Exact session IDs explicitly parsed from process args */
+  directSessionIds: string[];
+  /** Number of discovered OpenCode processes per readable cwd */
+  directoryProcessCounts: Record<string, number>;
+  /** Diagnostics for every attempted process cwd read */
+  cwdReadDiagnostics: CwdReadDiagnostic[];
   /** Whether the OS process scan succeeded */
   scanSucceeded: boolean;
+}
+
+interface ParsedProcessLine {
+  pid: number;
+  args: string[];
+}
+
+export interface ParsedOpenCodeProcess {
+  pid: number;
+  sessionId: string | null;
+  port?: number;
+  isServe: boolean;
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+function errorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message;
+  return typeof error === 'string' ? error : undefined;
+}
+
+function cwdStatusForError(error: unknown): CwdReadStatus {
+  const code = errorCode(error);
+  const message = errorMessage(error)?.toLowerCase() ?? '';
+  if (code === 'ENOENT' || code === 'ESRCH') return 'not_found';
+  if (code === 'EACCES' || code === 'EPERM') return 'permission_denied';
+  if (code === 'ETIMEDOUT' || message.includes('timed out') || message.includes('timeout')) return 'timeout';
+  return 'unknown';
+}
+
+function parseProcessLine(line: string): ParsedProcessLine | null {
+  const match = line.trim().match(/^(\d+)\s+(.+)$/);
+  if (!match) return null;
+
+  return {
+    pid: parseInt(match[1]!, 10),
+    args: match[2]!.trim().split(/\s+/),
+  };
+}
+
+function isOpenCodeExecutable(arg: string): boolean {
+  return basename(arg) === 'opencode';
+}
+
+function openCodeArgIndex(args: string[]): number {
+  if (args.length === 0) return -1;
+  if (isOpenCodeExecutable(args[0]!)) return 0;
+  if (
+    ['node', 'bun', 'deno'].includes(basename(args[0]!))
+    && args[1]
+    && isOpenCodeExecutable(args[1])
+  ) {
+    return 1;
+  }
+  return -1;
+}
+
+function sessionIdFromArgs(args: string[]): string | null {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if ((arg === '-s' || arg === '--session' || arg === '--session-id') && args[i + 1]) {
+      return args[i + 1]!;
+    }
+    if (arg.startsWith('--session=')) return arg.slice('--session='.length) || null;
+    if (arg.startsWith('--session-id=')) return arg.slice('--session-id='.length) || null;
+  }
+  return null;
+}
+
+function portFromArgs(args: string[]): number | undefined {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === '--port' && args[i + 1]) {
+      const port = parseInt(args[i + 1]!, 10);
+      return Number.isFinite(port) ? port : undefined;
+    }
+    if (arg.startsWith('--port=')) {
+      const port = parseInt(arg.slice('--port='.length), 10);
+      return Number.isFinite(port) ? port : undefined;
+    }
+  }
+  return undefined;
+}
+
+export function parseOpenCodeProcessLine(line: string): ParsedOpenCodeProcess | null {
+  const parsed = parseProcessLine(line);
+  if (!parsed) return null;
+
+  const commandIndex = openCodeArgIndex(parsed.args);
+  if (commandIndex === -1) return null;
+
+  const opencodeArgs = parsed.args.slice(commandIndex + 1);
+  const isServe = opencodeArgs[0] === 'serve';
+  if (isServe) {
+    const port = portFromArgs(opencodeArgs);
+    return {
+      pid: parsed.pid,
+      sessionId: sessionIdFromArgs(opencodeArgs),
+      port,
+      isServe: true,
+    };
+  }
+
+  return { pid: parsed.pid, sessionId: sessionIdFromArgs(opencodeArgs), isServe: false };
 }
 
 /**
  * Resolve the CWD for a PID over /proc (Linux) or lsof (macOS).
  */
-function getCwdForPid(pid: number): string | null {
+function getCwdForPid(pid: number): CwdReadDiagnostic {
   try {
     if (platform() === 'linux') {
-      const cwdPath = `/proc/${pid}/cwd`;
-      if (!existsSync(cwdPath)) return null;
-      return readlinkSync(cwdPath);
+      const cwd = readlinkSync(`/proc/${pid}/cwd`);
+      return { pid, status: 'ok', cwd, method: 'proc' };
     }
     const output = execSync(`lsof -p ${pid} 2>/dev/null`, {
       encoding: 'utf-8', timeout: 2000,
     });
     const cwdLine = output.split('\n').find((l) => l.includes(' cwd '));
-    return cwdLine?.trim().split(/\s+/).slice(8).join(' ') || null;
-  } catch {
-    return null;
+    const cwd = cwdLine?.trim().split(/\s+/).slice(8).join(' ') || null;
+    return { pid, status: cwd ? 'ok' : 'unknown', cwd, method: 'lsof' };
+  } catch (error) {
+    return {
+      pid,
+      status: cwdStatusForError(error),
+      cwd: null,
+      method: platform() === 'linux' ? 'proc' : 'lsof',
+      error: errorMessage(error),
+    };
   }
 }
 
@@ -62,44 +194,39 @@ export function scanProcesses(): ProcessScanResult {
     const seenPorts = new Set<number>();
 
     for (const line of psOutput.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+      const parsed = parseOpenCodeProcessLine(line);
+      if (!parsed) continue;
 
-      // TUI: `opencode`, `/path/to/opencode`, or wrapper-invoked
-      // `node|bun|deno /path/to/opencode`, optionally with `-s sessionId`.
-      const tuiMatch = trimmed.match(
-        /^(\d+)\s+(?:(?:node|bun|deno)\s+\S*\/opencode|\S*\/opencode|opencode)(?:\s+-s\s+(\S+))?$/
-      );
-      if (tuiMatch) {
-        const pid = parseInt(tuiMatch[1]!, 10);
-        const sessionId = tuiMatch[2] ?? null;
-        const cwd = getCwdForPid(pid);
-        processes.push({ pid, cwd, sessionId, isServe: false });
-        continue;
-      }
-
-      // Serve: `opencode serve ... --port PORT` with the same executable forms.
-      const serveMatch = trimmed.match(
-        /^(\d+)\s+(?:(?:node|bun|deno)\s+\S*\/opencode|\S*\/opencode|opencode)\s+serve\s+.*--port\s+(\d+)/
-      );
-      if (serveMatch) {
-        const pid = parseInt(serveMatch[1]!, 10);
-        const port = parseInt(serveMatch[2]!, 10);
-        const cwd = getCwdForPid(pid);
-        processes.push({ pid, cwd, sessionId: null, port, isServe: true });
-        seenPorts.add(port);
-        continue;
-      }
+      const cwdRead = getCwdForPid(parsed.pid);
+      processes.push({
+        pid: parsed.pid,
+        cwd: cwdRead.cwd,
+        cwdRead,
+        sessionId: parsed.sessionId,
+        port: parsed.port,
+        isServe: parsed.isServe,
+      });
+      if (parsed.port !== undefined) seenPorts.add(parsed.port);
     }
 
     const liveDirectories = [...new Set(processes.map((p) => p.cwd).filter((cwd): cwd is string => !!cwd))];
-    const liveSessionIds = [...new Set(processes.map((p) => p.sessionId).filter((id): id is string => !!id))];
+    const directSessionIds = [...new Set(processes.map((p) => p.sessionId).filter((id): id is string => !!id))];
+    const directoryProcessCounts = processes.reduce<Record<string, number>>((counts, process) => {
+      if (process.cwd) counts[process.cwd] = (counts[process.cwd] ?? 0) + 1;
+      return counts;
+    }, {});
+    const cwdReadDiagnostics = processes
+      .map((process) => process.cwdRead)
+      .filter((diagnostic): diagnostic is CwdReadDiagnostic => !!diagnostic);
 
     return {
       processes,
       servePorts: [...seenPorts],
       liveDirectories,
-      liveSessionIds,
+      liveSessionIds: directSessionIds,
+      directSessionIds,
+      directoryProcessCounts,
+      cwdReadDiagnostics,
       scanSucceeded: true,
     };
   } catch {
@@ -108,41 +235,10 @@ export function scanProcesses(): ProcessScanResult {
       servePorts: [],
       liveDirectories: [],
       liveSessionIds: [],
+      directSessionIds: [],
+      directoryProcessCounts: {},
+      cwdReadDiagnostics: [],
       scanSucceeded: false,
     };
-  }
-}
-
-/**
- * Query a serve process's /session endpoint to discover sessions it hosts.
- */
-export async function getSessionsFromPort(
-  port: number,
-): Promise<Array<{ id: string; directory?: string }>> {
-  try {
-    const res = await fetch(`http://localhost:${port}/session`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!res.ok) return [];
-    return (await res.json()) as Array<{ id: string; directory?: string }>;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Query a serve process's /session/status endpoint.
- */
-export async function getStatusFromPort(
-  port: number,
-): Promise<Record<string, unknown>> {
-  try {
-    const res = await fetch(`http://localhost:${port}/session/status`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!res.ok) return {};
-    return (await res.json()) as Record<string, unknown>;
-  } catch {
-    return {};
   }
 }

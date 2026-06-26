@@ -35,6 +35,12 @@ node scripts/property-test-agents-api.mjs
 echo "Running status inference self-test..."
 node scripts/test-status-inference.mjs
 
+echo "Running OpenCode liveness self-test..."
+node scripts/test-opencode-liveness.mjs
+
+echo "Running process poller parser self-test..."
+node scripts/test-process-poller.mjs
+
 if [[ "$run_long" == "true" ]]; then
   echo "No long-running dashboard tests are currently defined."
 fi

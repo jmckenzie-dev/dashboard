@@ -10,19 +10,23 @@
 //   - submit_plan running must stay blocked_review (no 60s staleness cutoff)
 //   - question running -> blocked_question (durable fallback)
 //   - stale `running` tool from a dead turn must NOT be working (turn-scoping)
+//   - recent step-finish(reason=tool-calls) handoffs stay briefly working
+//   - recent reasoning/text updates retain active phase while within grace
 //   - completed turn (reason=stop) -> complete within 5m, idle after
 //   - live /permission and /question signals take priority
 //   - blocking states are mutually exclusive and prioritized over working/idle
 //
 // Logs to ./logs/ alongside the other dashboard scripts.
 
-import { createWriteStream, mkdirSync, rmSync } from 'node:fs';
+import { createWriteStream, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
+const require = createRequire(import.meta.url);
 
 mkdirSync(join(ROOT, 'logs'), { recursive: true });
 const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '_');
@@ -68,7 +72,7 @@ const tsc = join(ROOT, 'node_modules', '.bin', 'tsc');
 const tscRes = spawnSync(tsc, [
   join('src', 'lib', 'status', 'inference.ts'),
   '--outDir', OUT_DIR,
-  '--module', 'es2022',
+  '--module', 'commonjs',
   '--target', 'es2022',
   '--moduleResolution', 'node',
   '--skipLibCheck',
@@ -83,8 +87,9 @@ if (tscRes.status !== 0) {
   process.exit(1);
 }
 
-const inference = await import('file://' + join(OUT_DIR, 'status', 'inference.js'));
-const { analyzeParts, inferOpencodeStatus, COMPLETE_FRESH_MS, WORKING_GRACE_MS } = inference;
+writeFileSync(join(OUT_DIR, 'package.json'), '{"type":"commonjs"}\n');
+const inference = require(join(OUT_DIR, 'status', 'inference.js'));
+const { analyzeParts, inferOpencodeStatus, inferPhase, COMPLETE_FRESH_MS, WORKING_GRACE_MS } = inference;
 
 console.log(`Compiled inference.ts. COMPLETE_FRESH_MS=${COMPLETE_FRESH_MS} WORKING_GRACE_MS=${WORKING_GRACE_MS}\n`);
 
@@ -97,6 +102,12 @@ function toolPart(tool, status, opts = {}) {
 }
 function stepFinish(reason, time) {
   return { type: 'step-finish', reason, time: time ?? clock };
+}
+function reasoningPart(time) {
+  return { type: 'reasoning', time: time ?? clock };
+}
+function textPart(time) {
+  return { type: 'text', time: time ?? clock };
 }
 
 function run(input) {
@@ -149,6 +160,15 @@ r = analyzeParts([
   toolPart('bash', 'error', { callID: 'bad', time: 200 }),
 ]);
 assertEqual(r.hasError, true, 'latest tool error is current error');
+
+// 4d. Later natural stop keeps a historical running tool inactive even if the
+// tool part was never terminalized by callID.
+r = analyzeParts([
+  toolPart('bash', 'running', { callID: 'old-running', time: 100 }),
+  textPart(150),
+  stepFinish('stop', 200),
+]);
+assertEqual(r.latestTool && r.latestTool.active, false, 'later natural stop terminalizes historical running tool');
 
 console.log('\n--- inferOpencodeStatus: blocking priority & mutual exclusivity ---');
 
@@ -266,6 +286,73 @@ assertEqual(run({
   sessionStatus: null, latestTool: null, latestStepReason: 'stop',
   hasPermission: false, hasQuestion: false, lastActivityMs: 60_000, hasError: false,
 }), 'complete', 'hasError=false does not affect non-error status');
+
+// 20. Recent model-to-tool handoff (`step-finish` reason=tool-calls) remains
+// working during the short handoff gap before the tool part is persisted.
+const handoff = analyzeParts([
+  textPart(100),
+  stepFinish('tool-calls', 110),
+]);
+assertEqual(handoff.latestStepReason, 'tool-calls', 'latest step reason captures tool-calls handoff');
+assertEqual(run({
+  sessionStatus: null,
+  latestTool: handoff.latestTool,
+  latestStepReason: handoff.latestStepReason,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: WORKING_GRACE_MS - 1,
+}), 'working', 'recent tool-calls handoff -> working during grace');
+
+// 21. The same handoff must not create stale activity forever.
+assertEqual(run({
+  sessionStatus: null,
+  latestTool: handoff.latestTool,
+  latestStepReason: handoff.latestStepReason,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: WORKING_GRACE_MS + 1,
+}), 'idle', 'stale tool-calls handoff -> idle after grace');
+
+// 22. Recent reasoning/text activity, represented by the normalized part time
+// (the SQLite path uses max(time_created,time_updated)), stays active and keeps
+// its phase while inside the grace window.
+const recentReasoning = analyzeParts([
+  reasoningPart(300),
+]);
+const reasoningStatus = run({
+  sessionStatus: null,
+  latestTool: recentReasoning.latestTool,
+  latestStepReason: recentReasoning.latestStepReason,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: WORKING_GRACE_MS - 1,
+});
+assertEqual(reasoningStatus, 'working', 'recent reasoning update -> working during grace');
+assertEqual(inferPhase(
+  reasoningStatus,
+  recentReasoning.latestPartType,
+  recentReasoning.latestPartIsActiveTool,
+  recentReasoning.latestTool,
+), 'reasoning', 'recent reasoning update -> reasoning phase');
+
+const recentText = analyzeParts([
+  textPart(400),
+]);
+const textStatus = run({
+  sessionStatus: null,
+  latestTool: recentText.latestTool,
+  latestStepReason: recentText.latestStepReason,
+  hasPermission: false,
+  hasQuestion: false,
+  lastActivityMs: WORKING_GRACE_MS - 1,
+});
+assertEqual(textStatus, 'working', 'recent text update -> working during grace');
+assertEqual(inferPhase(
+  textStatus,
+  recentText.latestPartType,
+  recentText.latestPartIsActiveTool,
+  recentText.latestTool,
+), 'generating', 'recent text update -> generating phase');
 
 console.log('\n--- mutual exclusivity / priority property sweep ---');
 const baseInput = {
