@@ -2,6 +2,11 @@ import type { OpenCodeSessionReason } from './types';
 
 export const RECENT_ACTIVE_FALLBACK_MS = 30_000;
 
+// Maximum age of an active-tool signal to count as evidence of liveness.
+// Tools stuck in 'running' for longer than this are assumed orphaned
+// (owning process died without terminalizing the tool).
+export const ACTIVE_TOOL_LIVENESS_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
 export type OpenCodeStatusType = 'idle' | 'busy' | 'retry' | null | undefined;
 
 export function hasOpenCodeStatusLiveness(status: OpenCodeStatusType): boolean {
@@ -25,9 +30,16 @@ export interface OpenCodeLivenessDecision {
   visibilityReason: OpenCodeSessionReason;
 }
 
-function directReason(candidate: OpenCodeLivenessCandidate): OpenCodeSessionReason | null {
+function directReason(
+  candidate: OpenCodeLivenessCandidate,
+  now: number,
+): OpenCodeSessionReason | null {
   if (candidate.hasBlockingRequest) return 'blocking_request';
-  if (candidate.hasActiveTool) return 'active_tool';
+  if (candidate.hasActiveTool) {
+    if (now - candidate.lastActivity.getTime() <= ACTIVE_TOOL_LIVENESS_MAX_AGE_MS) {
+      return 'active_tool';
+    }
+  }
   if (candidate.hasProcessSessionId) return 'process_session_id';
   if (candidate.hasStatusSignal) return 'status_map';
   return null;
@@ -42,7 +54,7 @@ export function allocateOpenCodeLiveness(
   const directIds = new Set<string>();
 
   for (const candidate of candidates) {
-    const reason = directReason(candidate);
+    const reason = directReason(candidate, now);
     if (!reason) continue;
     directIds.add(candidate.id);
     decisions.set(candidate.id, {
