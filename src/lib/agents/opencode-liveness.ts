@@ -30,9 +30,23 @@ export interface OpenCodeLivenessDecision {
   visibilityReason: OpenCodeSessionReason;
 }
 
+/**
+ * Determine whether a candidate has a direct (non-allocated) liveness signal.
+ *
+ * Signals are checked in descending reliability order. The `process_session_id`
+ * signal (process argv `-s` flag) is suppressed when the candidate's directory
+ * already has a different session confirmed alive by `/session/status`
+ * (`status_map`). Rationale: opencode `/new` creates a new session ID but the
+ * process argv is immutable on Linux — the old session ID lingers in
+ * /proc/<pid>/cmdline even though the process has moved on.
+ *
+ * Without this guard, an errored session superseded by `/new` stays visible
+ * indefinitely via the stale `process_session_id` signal.
+ */
 function directReason(
   candidate: OpenCodeLivenessCandidate,
   now: number,
+  directoriesWithStatusSignal: Set<string>,
 ): OpenCodeSessionReason | null {
   if (candidate.hasBlockingRequest) return 'blocking_request';
   if (candidate.hasActiveTool) {
@@ -40,7 +54,16 @@ function directReason(
       return 'active_tool';
     }
   }
-  if (candidate.hasProcessSessionId) return 'process_session_id';
+  if (candidate.hasProcessSessionId) {
+    // If this directory already has a session confirmed alive via
+    // /session/status, the process_session_id signal is stale (the
+    // process's argv still references an old session ID after /new).
+    if (!candidate.directory || !directoriesWithStatusSignal.has(candidate.directory)) {
+      return 'process_session_id';
+    }
+    // Fall through: the candidate can still get liveness via
+    // status_map (if it has one) or cwd_allocated / fallback.
+  }
   if (candidate.hasStatusSignal) return 'status_map';
   return null;
 }
@@ -53,8 +76,19 @@ export function allocateOpenCodeLiveness(
   const decisions = new Map<string, OpenCodeLivenessDecision>();
   const directIds = new Set<string>();
 
+  // Compute directories that have at least one session confirmed alive by
+  // /session/status. Used below to detect stale process_session_id signals
+  // when a process has moved on (e.g. after `/new`) but its argv still
+  // references an old session ID.
+  const directoriesWithStatusSignal = new Set<string>();
   for (const candidate of candidates) {
-    const reason = directReason(candidate, now);
+    if (candidate.hasStatusSignal && candidate.directory) {
+      directoriesWithStatusSignal.add(candidate.directory);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const reason = directReason(candidate, now, directoriesWithStatusSignal);
     if (!reason) continue;
     directIds.add(candidate.id);
     decisions.set(candidate.id, {

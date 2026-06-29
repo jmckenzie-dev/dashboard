@@ -190,6 +190,14 @@ for (let seed = 1; seed <= 200; seed++) {
 
   propertyChecks += 1;
   for (const direct of candidates.filter(hasDirectSignal)) {
+    // A hasProcessSessionId candidate is legitimately suppressed when another
+    // session in the same directory has hasStatusSignal (stale argv after /new).
+    if (direct.hasProcessSessionId && !direct.hasStatusSignal && direct.directory) {
+      const hasConflictingStatusSignal = candidates.some(
+        (c) => c.id !== direct.id && c.directory === direct.directory && c.hasStatusSignal,
+      );
+      if (hasConflictingStatusSignal) continue;
+    }
     if (propertyDecisions.get(direct.id)?.instanceAlive !== true) {
       propertyFailures.push({
         seed,
