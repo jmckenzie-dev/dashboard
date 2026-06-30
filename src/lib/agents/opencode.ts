@@ -15,6 +15,7 @@ import {
 import type {
   LatestToolInfo,
   NormalizedPart,
+  OpencodeStatusInput,
 } from '../status/inference';
 import { loadConfig } from '../config';
 import { scanProcesses } from '../process/poller';
@@ -77,6 +78,10 @@ interface ParsedPartData {
   hasError: boolean;
   latestPartType: string | null;
   latestPartIsActiveTool: boolean;
+  // The normalized parts that were fed to analyzeParts. Exposed so diagnostic
+  // callers (e.g. the diagnose endpoint / dump script) can show the raw signal
+  // that produced latestTool/hasError without re-reading the DB.
+  normalizedParts: NormalizedPart[];
 }
 
 // Live-API-only blocking signals, keyed by session id.
@@ -98,12 +103,41 @@ interface SessionCandidate {
   liveness: OpenCodeLivenessCandidate;
 }
 
+// Per-session inference internals, captured for diagnostics (the diagnose
+// endpoint and the dump script). The liveness DECISION outputs
+// (instanceAlive/livenessReason/visibilityReason) are already on the
+// AgentSession itself; this object holds the INPUTS to status inference plus
+// the normalized parts so a reader can answer "why is this session X?".
+export interface SessionDiagnostic {
+  sessionStatus: OpenCodeSessionStatus | null;
+  hasActiveInstance: boolean;
+  permIds: string[];
+  questIds: string[];
+  latestTool: LatestToolInfo | null;
+  latestStepReason: string | null;
+  hasError: boolean;
+  latestPartType: string | null;
+  latestPartIsActiveTool: boolean;
+  lastActivityMs: number;
+  inferenceInput: OpencodeStatusInput;
+  livenessCandidate: {
+    hasStatusSignal: boolean;
+    hasBlockingRequest: boolean;
+    hasActiveTool: boolean;
+    hasProcessSessionId: boolean;
+  };
+  parts: NormalizedPart[];
+}
+
+export type DiagnosticAgentSession = AgentSession & { diagnostic: SessionDiagnostic };
+
 interface OpenCodeSQLiteOptions {
   canSendInput: boolean;
   statusData: Record<string, OpenCodeSessionStatusResponse>;
   blocking: BlockingRequests;
   liveness: InstanceLiveness;
   includeHidden: boolean;
+  captureDiagnostics?: boolean;
 }
 
 function toEpochMs(value: number | null | undefined): number {
@@ -216,6 +250,7 @@ function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
     hasError,
     latestPartType,
     latestPartIsActiveTool,
+    normalizedParts: normalized,
   };
 }
 
@@ -439,6 +474,7 @@ async function getSessionsViaAPI(
   blocking: BlockingRequests,
   liveness: InstanceLiveness,
   includeHidden: boolean,
+  captureDiagnostics?: boolean,
 ): Promise<AgentSession[]> {
   try {
     const response = await fetch(`${apiBase}/session`, {
@@ -470,6 +506,7 @@ async function getSessionsViaAPI(
       let latestPartType: string | null = null;
       let latestPartIsActiveTool = false;
       let currentMode: string | undefined;
+      let normalized: NormalizedPart[] = [];
 
       if (hasActiveInstance || lastActivityMs < 2 * 60 * 60 * 1000 || index < 25) {
         try {
@@ -488,7 +525,7 @@ async function getSessionsViaAPI(
               parts: Array<{ type: string; text?: string; tool?: string; callID?: string; state?: { status?: string }; reason?: string }>;
             }>;
 
-            const normalized: NormalizedPart[] = [];
+            normalized = [];
             for (const message of msgData.slice(-10)) {
               if (message.info.agent) {
                 currentMode = message.info.agent;
@@ -529,7 +566,7 @@ async function getSessionsViaAPI(
       const permIds = blocking.permissionsBySession.get(session.id) ?? [];
       const questIds = blocking.questionsBySession.get(session.id) ?? [];
 
-      const status = inferOpencodeStatus({
+      const inferenceInput: OpencodeStatusInput = {
         sessionStatus,
         latestTool,
         latestStepReason,
@@ -537,7 +574,8 @@ async function getSessionsViaAPI(
         hasQuestion: questIds.length > 0,
         lastActivityMs,
         hasError,
-      });
+      };
+      const status = inferOpencodeStatus(inferenceInput);
       const phase = inferPhase(status, latestPartType, latestPartIsActiveTool, latestTool);
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
@@ -545,6 +583,16 @@ async function getSessionsViaAPI(
         : blockReason === 'question'
           ? questIds
           : [];
+      const livenessCandidate = {
+        id: session.id,
+        parentId: parentRaw,
+        directory: session.directory,
+        lastActivity,
+        hasStatusSignal: hasOpenCodeStatusLiveness(sessionStatus),
+        hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
+        hasActiveTool: latestTool?.active === true,
+        hasProcessSessionId: liveness.liveSessionIds.has(session.id),
+      };
       const agentSession: AgentSession = {
         id: `opencode-${session.id}`,
         parentId: parentRaw ? `opencode-${parentRaw}` : undefined,
@@ -563,18 +611,32 @@ async function getSessionsViaAPI(
         blockingRequestIds: blockingRequestIds.length > 0 ? blockingRequestIds : undefined,
       };
 
+      if (captureDiagnostics) {
+        (agentSession as DiagnosticAgentSession).diagnostic = {
+          sessionStatus,
+          hasActiveInstance,
+          permIds,
+          questIds,
+          latestTool,
+          latestStepReason,
+          hasError,
+          latestPartType,
+          latestPartIsActiveTool,
+          lastActivityMs,
+          inferenceInput,
+          livenessCandidate: {
+            hasStatusSignal: livenessCandidate.hasStatusSignal,
+            hasBlockingRequest: livenessCandidate.hasBlockingRequest,
+            hasActiveTool: livenessCandidate.hasActiveTool,
+            hasProcessSessionId: livenessCandidate.hasProcessSessionId,
+          },
+          parts: normalized,
+        };
+      }
+
       candidates.push({
         session: agentSession,
-        liveness: {
-          id: session.id,
-          parentId: parentRaw,
-          directory: session.directory,
-          lastActivity,
-          hasStatusSignal: hasOpenCodeStatusLiveness(sessionStatus),
-          hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
-          hasActiveTool: latestTool?.active === true,
-          hasProcessSessionId: liveness.liveSessionIds.has(session.id),
-        },
+        liveness: livenessCandidate,
       });
     }
 
@@ -626,7 +688,7 @@ async function getSessionsViaSQLite(
 
       const permIds = options.blocking.permissionsBySession.get(session.id) ?? [];
       const questIds = options.blocking.questionsBySession.get(session.id) ?? [];
-      const status = inferOpencodeStatus({
+      const inferenceInput: OpencodeStatusInput = {
         sessionStatus,
         latestTool: parsed.latestTool,
         latestStepReason: parsed.latestStepReason,
@@ -634,7 +696,8 @@ async function getSessionsViaSQLite(
         hasQuestion: questIds.length > 0,
         lastActivityMs,
         hasError: parsed.hasError,
-      });
+      };
+      const status = inferOpencodeStatus(inferenceInput);
       const phase = inferPhase(status, parsed.latestPartType, parsed.latestPartIsActiveTool, parsed.latestTool);
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
@@ -642,6 +705,16 @@ async function getSessionsViaSQLite(
         : blockReason === 'question'
           ? questIds
           : [];
+      const livenessCandidate = {
+        id: session.id,
+        parentId: session.parent_id,
+        directory: session.directory,
+        lastActivity,
+        hasStatusSignal: hasOpenCodeStatusLiveness(sessionStatus),
+        hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
+        hasActiveTool: parsed.latestTool?.active === true,
+        hasProcessSessionId: options.liveness.liveSessionIds.has(session.id),
+      };
       const agentSession: AgentSession = {
         id: `opencode-${session.id}`,
         parentId: session.parent_id ? `opencode-${session.parent_id}` : undefined,
@@ -659,18 +732,32 @@ async function getSessionsViaSQLite(
         blockingRequestIds: blockingRequestIds.length > 0 ? blockingRequestIds : undefined,
       };
 
+      if (options.captureDiagnostics) {
+        (agentSession as DiagnosticAgentSession).diagnostic = {
+          sessionStatus,
+          hasActiveInstance,
+          permIds,
+          questIds,
+          latestTool: parsed.latestTool,
+          latestStepReason: parsed.latestStepReason,
+          hasError: parsed.hasError,
+          latestPartType: parsed.latestPartType,
+          latestPartIsActiveTool: parsed.latestPartIsActiveTool,
+          lastActivityMs,
+          inferenceInput,
+          livenessCandidate: {
+            hasStatusSignal: livenessCandidate.hasStatusSignal,
+            hasBlockingRequest: livenessCandidate.hasBlockingRequest,
+            hasActiveTool: livenessCandidate.hasActiveTool,
+            hasProcessSessionId: livenessCandidate.hasProcessSessionId,
+          },
+          parts: parsed.normalizedParts,
+        };
+      }
+
       candidates.push({
         session: agentSession,
-        liveness: {
-          id: session.id,
-          parentId: session.parent_id,
-          directory: session.directory,
-          lastActivity,
-          hasStatusSignal: hasOpenCodeStatusLiveness(sessionStatus),
-          hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
-          hasActiveTool: parsed.latestTool?.active === true,
-          hasProcessSessionId: options.liveness.liveSessionIds.has(session.id),
-        },
+        liveness: livenessCandidate,
       });
     }
 
@@ -683,11 +770,12 @@ async function getSessionsViaSQLite(
 }
 
 export async function getOpenCodeSessions(
-  optionsArg: { includeHidden?: boolean } = {},
+  optionsArg: { includeHidden?: boolean; captureDiagnostics?: boolean } = {},
 ): Promise<AgentSession[]> {
   const config = await loadConfig();
   const agentConfig = config.agents.opencode;
   const includeHidden = optionsArg.includeHidden === true;
+  const captureDiagnostics = optionsArg.captureDiagnostics === true;
 
   if (!agentConfig.enabled) return [];
 
@@ -726,6 +814,7 @@ export async function getOpenCodeSessions(
       blocking,
       liveness,
       includeHidden,
+      captureDiagnostics,
     });
 
     if (sqliteSessions.length > 0) {
@@ -734,10 +823,23 @@ export async function getOpenCodeSessions(
   }
 
   if (agentConfig.apiBase && apiAvailable && options) {
-    return getSessionsViaAPI(agentConfig.apiBase, options, statusData, blocking, liveness, includeHidden);
+    return getSessionsViaAPI(agentConfig.apiBase, options, statusData, blocking, liveness, includeHidden, captureDiagnostics);
   }
 
   return [];
+}
+
+/**
+ * Variant of {@link getOpenCodeSessions} that attaches a per-session
+ * {@link SessionDiagnostic} (inference inputs + normalized parts) to each
+ * returned session. Used by the diagnose endpoint and the dump script. The
+ * diagnostic object is only populated when requested via this entry point, so
+ * normal polling paths are unaffected.
+ */
+export async function getOpenCodeSessionsWithDiagnostics(
+  optionsArg: { includeHidden?: boolean } = {},
+): Promise<DiagnosticAgentSession[]> {
+  return getOpenCodeSessions({ ...optionsArg, captureDiagnostics: true }) as Promise<DiagnosticAgentSession[]>;
 }
 
 async function getSessionDirectoryViaSQLite(dbPath: string, sessionId: string): Promise<string | null> {

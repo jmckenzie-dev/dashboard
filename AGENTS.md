@@ -19,7 +19,7 @@ Guidance for agentic coding assistants working in this repository.
 - `src/lib/auth.ts`: basic auth + bcrypt password hash checks
 - `src/lib/llm/summarizer.ts`: LLM summary generation with cache/fallbacks
 - `src/lib/notifications`: sound + skill hooks on status transitions
-- `scripts/`: local shell helpers (`start-dashboard.sh`, cert generation)
+- `scripts/`: local shell/node helpers (`start-dashboard.sh`, cert generation, status-inference & liveness self-tests, `dump-sessions.mjs` debug dumper)
 
 ## Install And Run
 
@@ -36,6 +36,7 @@ Guidance for agentic coding assistants working in this repository.
 
 - Primary project check (type/svelte diagnostics): `npm run check`
 - Build verification: `npm run build`
+- Session status debug dump: `npm run dump:sessions` (see "Debugging Session Status" below)
 - There is no dedicated linter script (`lint`) configured in `package.json`.
 - There is no test runner script (`test`) configured in `package.json`.
 
@@ -59,6 +60,41 @@ Guidance for agentic coding assistants working in this repository.
 - If changing APIs, verify both route handlers and matching UI consumers.
 - Keep edits small and consistent with existing file style.
 - Do not introduce new tooling (eslint/prettier/test runner) unless explicitly requested.
+
+## Debugging Session Status
+
+When investigating why a session shows an unexpected status (e.g. an `error`
+session that should be `idle`/`blocked`, or a stale session that won't hide),
+run the dump script — it compiles and calls the **real** production pipeline
+(`getOpenCodeSessionsWithDiagnostics` in `src/lib/agents/opencode.ts`) and prints
+the per-session state the dashboard actually sees. It does NOT reimplement any
+inference/liveness/parsing logic.
+
+```bash
+npm run dump:sessions                       # all sessions, human-readable
+npm run dump:sessions -- --session <substr> # filter by raw id / opencode-<id> / title
+npm run dump:sessions -- --json             # machine-readable (jq-friendly)
+npm run dump:sessions -- --no-parts         # omit the raw parts block
+npm run dump:sessions -- --no-hidden        # exclude hidden_stale sessions
+```
+
+Per session it shows: identity, API signals (`sessionStatus`,
+`hasActiveInstance`, permission/question request ids), the exact inference
+inputs (`latestTool` with tool/status/active, `hasError`, `latestStepReason`,
+the full `inferenceInput` object), the inferred status/phase, the liveness
+candidate + decision (`instanceAlive`/`livenessReason`/`visibilityReason`), and
+the recent normalized parts. Output is tee'd to
+`./logs/dump_sessions_<timestamp>.log`.
+
+The same per-session inference data is also exposed by the authenticated
+`GET /api/status/diagnose` endpoint (`src/routes/api/status/diagnose/+server.ts`)
+when you cannot shell into the host running the dashboard. Reach for the script
+first for local debugging; use the endpoint for remote/agent-driven inspection.
+
+Common finding: an `error` session usually has
+`latestTool={tool:'submit_plan'|'question', status:'error', active:false}` with
+`hasError=true` — escaping a plan/question prompt terminalizes that tool part to
+`error`, and `src/lib/status/inference.ts` latches `error` regardless of age.
 
 ## TypeScript And Svelte Standards
 

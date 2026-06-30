@@ -16,13 +16,17 @@ import {
   countStatuses,
   blockedTotal,
 } from '$lib/agents';
-import { getOpenCodeSessions } from '$lib/agents/opencode';
+import {
+  getOpenCodeSessions,
+  getOpenCodeSessionsWithDiagnostics,
+} from '$lib/agents/opencode';
+import type { DiagnosticAgentSession, SessionDiagnostic } from '$lib/agents/opencode';
 import { scanProcesses } from '$lib/process/poller';
 import { isBlocked } from '$lib/agents/types';
 import type { AgentSession } from '$lib/agents/types';
 
-function describeSession(s: AgentSession, visible: boolean) {
-  return {
+function describeSession(s: AgentSession, visible: boolean, diagnostic?: SessionDiagnostic) {
+  const base = {
     id: s.id,
     parentId: s.parentId ?? null,
     type: s.type,
@@ -44,6 +48,29 @@ function describeSession(s: AgentSession, visible: boolean) {
     messageCount: s.messages.length,
     blockingRequestIds: s.blockingRequestIds ?? [],
   };
+  return diagnostic ? { ...base, diagnostic: describeDiagnostic(diagnostic) } : base;
+}
+
+// Compact, JSON-safe view of a SessionDiagnostic. Dates are absent here (the
+// diagnostic carries epoch-ms times on parts/tool). We keep the inference
+// inputs verbatim so a reader can reconstruct exactly why inferOpencodeStatus
+// returned the session's status.
+function describeDiagnostic(d: SessionDiagnostic) {
+  return {
+    sessionStatus: d.sessionStatus,
+    hasActiveInstance: d.hasActiveInstance,
+    permIds: d.permIds,
+    questIds: d.questIds,
+    latestTool: d.latestTool,
+    latestStepReason: d.latestStepReason,
+    hasError: d.hasError,
+    latestPartType: d.latestPartType,
+    latestPartIsActiveTool: d.latestPartIsActiveTool,
+    lastActivityMs: d.lastActivityMs,
+    inferenceInput: d.inferenceInput,
+    livenessCandidate: d.livenessCandidate,
+    parts: d.parts,
+  };
 }
 
 export const GET: RequestHandler = async (event) => {
@@ -56,14 +83,21 @@ export const GET: RequestHandler = async (event) => {
   const processScan = scanProcesses();
 
   const sessions = await getAllSessions();
-  const opencodeCandidates = await getOpenCodeSessions({ includeHidden: true });
+  const opencodeCandidates = await getOpenCodeSessionsWithDiagnostics({ includeHidden: true });
   const visibleSessionIds = new Set(sessions.map((s) => s.id));
-  const hiddenOpenCodeSessions = opencodeCandidates.filter((s) => !visibleSessionIds.has(s.id));
+  const hiddenOpenCodeSessions = opencodeCandidates.filter(
+    (s): s is DiagnosticAgentSession => !visibleSessionIds.has(s.id),
+  );
+  const diagnosticById = new Map(opencodeCandidates.map((s) => [s.id, s.diagnostic]));
   const counts = countStatuses(sessions);
 
   // Detailed session diagnostics
-  const sessionDetails = sessions.map((s) => describeSession(s, true));
-  const hiddenSessionDetails = hiddenOpenCodeSessions.map((s) => describeSession(s, false));
+  const sessionDetails = sessions.map((s) =>
+    describeSession(s, true, diagnosticById.get(s.id)),
+  );
+  const hiddenSessionDetails = hiddenOpenCodeSessions.map((s) =>
+    describeSession(s, false, s.diagnostic),
+  );
 
   // Build the parent→child tree for analysis
   const byId = new Map(sessions.map((s) => [s.id, s]));

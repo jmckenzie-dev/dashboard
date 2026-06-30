@@ -10,6 +10,7 @@
     "start": "node build/server.js",
     "start:https": "node scripts/server-https.js",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "dump:sessions": "node scripts/dump-sessions.mjs",
     "tauri": "tauri",
     "generate-certs": "bash scripts/generate-certs.sh"
   },

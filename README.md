@@ -110,6 +110,7 @@ Most runtime settings can be changed in `/settings`.
 - `POST /api/sounds` - upload a sound file.
 - `POST /api/sounds/:filename` - test-play a sound file.
 - `GET /api/events` - SSE stream for updates/transitions.
+- `GET /api/status/diagnose` - structured dump of dashboard internal state (per-session status inference inputs/outputs, liveness decisions, process inventory) for debugging why a session shows a given status.
 
 All API routes require auth when a password is configured.
 
@@ -125,6 +126,37 @@ Notes:
 - No dedicated `lint` script is configured.
 - No test runner is currently configured in this repository.
 
+## Debugging Session Status
+
+When a session shows an unexpected status (e.g. an `error` session that should be
+`idle`/`blocked`, or a session that won't disappear), use the diagnostic dump
+script to inspect the exact data the dashboard sees per session:
+
+```bash
+npm run dump:sessions                       # all sessions, human-readable
+npm run dump:sessions -- --session <substr> # filter by id or title substring
+npm run dump:sessions -- --json             # machine-readable (pipe to jq)
+npm run dump:sessions -- --no-parts         # omit the raw-parts block
+npm run dump:sessions -- --help
+```
+
+The script compiles and calls the **real** production session pipeline
+(`getOpenCodeSessionsWithDiagnostics` in `src/lib/agents/opencode.ts`) — it does
+not reimplement any status/liveness logic. For each session it prints the
+identity, API signals, the exact inputs to status inference (`latestTool`,
+`hasError`, `latestStepReason`, `sessionStatus`, the `inferenceInput` object),
+the inferred status/phase, the liveness candidate + decision, and the recent
+normalized parts. Output is also tee'd to `./logs/dump_sessions_<timestamp>.log`.
+
+For example, an `error` session typically shows
+`latestTool={tool:'submit_plan'|'question', status:'error', active:false}` with
+`hasError=true` — an escaped plan/question prompt terminalizes the tool part to
+`error`, and status inference latches `error` regardless of age.
+
+The same per-session inference data is also available over HTTP from the
+authenticated `GET /api/status/diagnose` endpoint (useful when you can't shell
+into the host running the dashboard).
+
 ## Project Layout
 
 - `src/routes` - dashboard pages and API routes
@@ -133,4 +165,4 @@ Notes:
 - `src/lib/auth.ts` - basic auth + bcrypt password checks
 - `src/lib/llm/summarizer.ts` - summary generation + fallback cache
 - `src/lib/notifications` - sound + skill hooks on status transitions
-- `scripts/` - local helper scripts (startup, cert generation)
+- `scripts/` - local helper scripts (startup, cert generation, status debugging, tests)
