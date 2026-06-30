@@ -39,3 +39,4 @@ coverage/
 *wt_*
 __pycache__
 logs/
+.cgcignore
