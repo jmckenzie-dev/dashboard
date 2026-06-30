@@ -38,6 +38,9 @@ node scripts/test-status-inference.mjs
 echo "Running OpenCode liveness self-test..."
 node scripts/test-opencode-liveness.mjs
 
+echo "Running visibility hysteresis self-test..."
+node scripts/test-visibility-hysteresis.mjs
+
 echo "Running process poller parser self-test..."
 node scripts/test-process-poller.mjs
 

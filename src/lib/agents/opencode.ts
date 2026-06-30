@@ -279,9 +279,17 @@ async function getSessionStatusData(
   options: OpenCodeAPIOptions,
 ): Promise<Record<string, OpenCodeSessionStatusResponse>> {
   try {
+    // Bounded latency: match the 1s budget already used by checkAPIServer.
+    // Without this, a slow /session/status response can hold a poll tick
+    // open indefinitely, which under the old setInterval loop caused
+    // overlapping snapshots and per-tick visibility flicker.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1000);
     const statusResponse = await fetch(`${apiBase}/session/status`, {
+      signal: controller.signal,
       headers: options.headers,
     });
+    clearTimeout(timeout);
     return statusResponse.ok
       ? await statusResponse.json() as Record<string, OpenCodeSessionStatusResponse>
       : {};
@@ -303,31 +311,41 @@ async function getBlockingRequests(
     questionsBySession: new Map(),
   };
   try {
-    const [permRes, questRes] = await Promise.all([
-      fetch(`${apiBase}/permission`, { headers: options.headers }).catch(() => null),
-      fetch(`${apiBase}/question`, { headers: options.headers }).catch(() => null),
-    ]);
+    // Bound both fetches with a shared 1s budget (matches checkAPIServer).
+    // We pass a single AbortController to both requests so a slow upstream
+    // surfaces as an empty result here rather than an unbounded tick.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1000);
+    const fetchOpts = { headers: options.headers, signal: controller.signal };
+    try {
+      const [permRes, questRes] = await Promise.all([
+        fetch(`${apiBase}/permission`, fetchOpts).catch(() => null),
+        fetch(`${apiBase}/question`, fetchOpts).catch(() => null),
+      ]);
 
-    if (permRes && permRes.ok) {
-      const perms = await permRes.json() as Array<{ id: string; sessionID?: string; sessionId?: string }>;
-      for (const p of perms) {
-        const sid = p.sessionID ?? p.sessionId;
-        if (!sid) continue;
-        const list = empty.permissionsBySession.get(sid) ?? [];
-        list.push(p.id);
-        empty.permissionsBySession.set(sid, list);
+      if (permRes && permRes.ok) {
+        const perms = await permRes.json() as Array<{ id: string; sessionID?: string; sessionId?: string }>;
+        for (const p of perms) {
+          const sid = p.sessionID ?? p.sessionId;
+          if (!sid) continue;
+          const list = empty.permissionsBySession.get(sid) ?? [];
+          list.push(p.id);
+          empty.permissionsBySession.set(sid, list);
+        }
       }
-    }
 
-    if (questRes && questRes.ok) {
-      const quests = await questRes.json() as Array<{ id: string; sessionID?: string; sessionId?: string }>;
-      for (const q of quests) {
-        const sid = q.sessionID ?? q.sessionId;
-        if (!sid) continue;
-        const list = empty.questionsBySession.get(sid) ?? [];
-        list.push(q.id);
-        empty.questionsBySession.set(sid, list);
+      if (questRes && questRes.ok) {
+        const quests = await questRes.json() as Array<{ id: string; sessionID?: string; sessionId?: string }>;
+        for (const q of quests) {
+          const sid = q.sessionID ?? q.sessionId;
+          if (!sid) continue;
+          const list = empty.questionsBySession.get(sid) ?? [];
+          list.push(q.id);
+          empty.questionsBySession.set(sid, list);
+        }
       }
+    } finally {
+      clearTimeout(timeout);
     }
   } catch (error) {
     console.warn('OpenCode blocking-request fetch failed:', error);

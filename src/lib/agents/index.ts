@@ -12,11 +12,18 @@ import {
 import { getClaudeSessions, sendClaudeMessage } from './claude';
 import { getCodexSessions, sendCodexMessage } from './codex';
 import { getGeminiSessions, sendGeminiMessage } from './gemini';
+import { computeVisibleSessions } from './visibility-hysteresis';
 
 // LRU cache for previous statuses — bounded to prevent unbounded memory growth.
 const MAX_TRACKED_SESSIONS = 200;
 const previousStatus = new Map<string, AgentStatus>();
 const transitionCallbacks: Array<(transition: StatusTransition) => void> = [];
+
+// Per-process hysteresis deadlines for OpenCode visibility. A session that
+// was directly visible within VISIBILITY_GRACE_MS stays visible across
+// transient "hidden_stale" gaps so actively-worked sessions stop flickering.
+// See src/lib/agents/visibility-hysteresis.ts.
+let opencodeVisibleUntil = new Map<string, number>();
 
 function isVisibleOpenCodeSession(session: AgentSession): boolean {
   const reason = session.visibilityReason ?? session.livenessReason ?? null;
@@ -177,7 +184,11 @@ export async function getAllSessions(): Promise<AgentSession[]> {
   //     getGeminiSessions()
   //   ]);
   //   const all = [...opencode, ...claude, ...codex, ...gemini];
-  const opencode = await getOpenCodeSessions();
+  // Fetch the FULL OpenCode set (including hidden_stale candidates) so the
+  // hysteresis layer can smooth short visibility gaps instead of never seeing
+  // them. Visibility filtering for OpenCode is delegated to
+  // computeVisibleSessions below.
+  const opencode = await getOpenCodeSessions({ includeHidden: true });
   const all = opencode;
 
   // Apply hierarchical blocking BEFORE visibility filtering so parent
@@ -191,11 +202,25 @@ export async function getAllSessions(): Promise<AgentSession[]> {
   const blockedWindow = now - 2 * 60 * 60 * 1000;
   const completeWindow = now - 30 * 60 * 1000;
 
-  const activeSessions = all.filter((session) => {
-    if (session.type === 'opencode') return isVisibleOpenCodeSession(session);
+  // Split by agent type: OpenCode visibility goes through the hysteresis
+  // layer (with the full candidate set as input); generic agents keep their
+  // own time-windowed predicate (unchanged semantics).
+  const opencodeCandidates = all.filter((session) => session.type === 'opencode');
+  const genericCandidates = all.filter((session) => session.type !== 'opencode');
 
-    return isVisibleGenericSession(session, recentWindow, blockedWindow, completeWindow);
+  const { visible: visibleOpenCode, visibleUntil: nextUntil } = computeVisibleSessions({
+    candidates: opencodeCandidates,
+    visibleUntil: opencodeVisibleUntil,
+    now,
+    isDirectlyVisible: isVisibleOpenCodeSession,
   });
+  opencodeVisibleUntil = nextUntil;
+
+  const visibleGeneric = genericCandidates.filter((session) =>
+    isVisibleGenericSession(session, recentWindow, blockedWindow, completeWindow),
+  );
+
+  const activeSessions = [...visibleOpenCode, ...visibleGeneric];
   
   return activeSessions.sort(compareSessions);
 }

@@ -14,17 +14,21 @@ export const GET: RequestHandler = async (event) => {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
+      let closed = false;
       
       const sendEvent = async (type: string, data: unknown) => {
         const message = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
         controller.enqueue(encoder.encode(message));
       };
-      
-      const pollInterval = setInterval(async () => {
+
+      // One poll cycle: gather the snapshot and emit an `update` event.
+      // Errors are logged and swallowed so a single failing tick cannot tear
+      // down the stream.
+      const pollOnce = async () => {
         try {
           const sessions = await getAllSessions();
           const counts = countStatuses(sessions);
-          
+
           // Only generate summaries for active sessions; idle/complete rely on
           // the existing cache (TTL 10-30 min) to avoid LLM calls every tick.
           // Messages are truncated server-side (last 5, 220 chars each).
@@ -45,25 +49,54 @@ export const GET: RequestHandler = async (event) => {
               };
             })
           );
-          
+
           await sendEvent('update', { sessions: sessionsWithSummaries, counts });
         } catch (error) {
           console.error('SSE poll error:', error);
         }
-      }, config.polling.intervalMs);
-      
+      };
+
       const unsubscribe = onStatusTransition(async (transition) => {
-        await sendEvent('transition', transition);
+        try {
+          await sendEvent('transition', transition);
+        } catch (error) {
+          console.error('SSE transition emit error:', error);
+        }
       });
       
       await sendEvent('connected', { timestamp: new Date().toISOString() });
       
       const keepAlive = setInterval(() => {
-        controller.enqueue(encoder.encode(': keepalive\n\n'));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(': keepalive\n\n'));
+        } catch (error) {
+          console.error('SSE keepalive error:', error);
+        }
       }, 15000);
+
+      // Self-scheduling non-overlapping poll loop. A new tick is only armed
+      // AFTER the previous tick fully settles, so slow opencode API responses
+      // can never cause overlapping snapshots that flicker the UI. Effective
+      // cadence is max(intervalMs, tickLatency); under load this degrades
+      // gracefully rather than corrupting each tick.
+      let pollTimer: ReturnType<typeof setTimeout> | null = null;
+      const scheduleNext = () => {
+        if (closed) return;
+        pollTimer = setTimeout(async () => {
+          pollTimer = null;
+          await pollOnce();
+          scheduleNext();
+        }, config.polling.intervalMs);
+      };
+      scheduleNext();
       
       event.request.signal.addEventListener('abort', () => {
-        clearInterval(pollInterval);
+        closed = true;
+        if (pollTimer) {
+          clearTimeout(pollTimer);
+          pollTimer = null;
+        }
         clearInterval(keepAlive);
         unsubscribe();
         try {
