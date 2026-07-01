@@ -1,5 +1,4 @@
 # TODO
-- [ ] Updating is very slow; want to get to 1 second polling updates.
 - [ ] Auto collapse w/subagents by default. Show (N subagents active of M total) or something instead in title.
 - [ ] Get git repo setup; remote origin at http://192.168.68.110:3000/jmckenzie/agent_dashboard.git. Need to create branch, commit all existing code, and push it.
 - [ ] On settings, add a button to check connectivity to the provided LLM Configuration and print out either green successful connection on test or red connection failed w/failure message. Use popup for both.
@@ -16,6 +15,7 @@
 # DONE
 
 ## Completed
+- [x] CPU Optimization & Prometheus Instrumentation: implemented background process polling, CWD caching, window function SQLite query consolidation, in-memory part caching, and metrics endpoint (/api/metrics) with self-tests.
 - [x] Group dashboard sessions by status (Error, Blocked, Working, Complete, Idle) and sort by updated descending
 - [x] Implement OpenCode liveness Phase 2 (OS process matching) per docs/reference_comparison.md.
 - [x] Implement session status resolution fixes: OS process inventory, error status, hierarchical blocking, multi-port discovery, fixed SQLite query, liveness-based visibility, and queryability API (GET /api/status/diagnose).

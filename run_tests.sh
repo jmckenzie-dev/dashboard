@@ -44,6 +44,9 @@ node scripts/test-visibility-hysteresis.mjs
 echo "Running process poller parser self-test..."
 node scripts/test-process-poller.mjs
 
+echo "Running dashboard poller & database optimization tests..."
+node scripts/test-optimize-poller.mjs
+
 if [[ "$run_long" == "true" ]]; then
   echo "No long-running dashboard tests are currently defined."
 fi

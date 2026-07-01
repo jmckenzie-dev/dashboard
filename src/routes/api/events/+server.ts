@@ -3,6 +3,7 @@ import { loadConfig } from '$lib/config';
 import { checkAuth, requireAuth } from '$lib/auth';
 import { countStatuses, getAllSessions, onStatusTransition } from '$lib/agents';
 import { generateSummary } from '$lib/llm/summarizer';
+import { pollDuration, sseClientsActive, sessionsTotal } from '$lib/metrics';
 
 export const GET: RequestHandler = async (event) => {
   const config = await loadConfig();
@@ -16,6 +17,9 @@ export const GET: RequestHandler = async (event) => {
       const encoder = new TextEncoder();
       let closed = false;
       
+      sseClientsActive.inc();
+      let activeDecremented = false;
+      
       const sendEvent = async (type: string, data: unknown) => {
         const message = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
         controller.enqueue(encoder.encode(message));
@@ -25,9 +29,16 @@ export const GET: RequestHandler = async (event) => {
       // Errors are logged and swallowed so a single failing tick cannot tear
       // down the stream.
       const pollOnce = async () => {
+        const start = process.hrtime();
         try {
           const sessions = await getAllSessions();
           const counts = countStatuses(sessions);
+
+          // Update active sessions status metrics
+          const allStatuses = ['working', 'blocked', 'blocked_permission', 'blocked_question', 'blocked_review', 'complete', 'idle', 'retry', 'error'];
+          for (const status of allStatuses) {
+            sessionsTotal.set({ status }, counts[status as keyof typeof counts] ?? 0);
+          }
 
           // Only generate summaries for active sessions; idle/complete rely on
           // the existing cache (TTL 10-30 min) to avoid LLM calls every tick.
@@ -53,6 +64,10 @@ export const GET: RequestHandler = async (event) => {
           await sendEvent('update', { sessions: sessionsWithSummaries, counts });
         } catch (error) {
           console.error('SSE poll error:', error);
+        } finally {
+          const diff = process.hrtime(start);
+          const duration = diff[0] + diff[1] / 1e9;
+          pollDuration.observe({ step: 'total' }, duration);
         }
       };
 
@@ -92,6 +107,10 @@ export const GET: RequestHandler = async (event) => {
       scheduleNext();
       
       event.request.signal.addEventListener('abort', () => {
+        if (!activeDecremented) {
+          sseClientsActive.dec();
+          activeDecremented = true;
+        }
         closed = true;
         if (pollTimer) {
           clearTimeout(pollTimer);

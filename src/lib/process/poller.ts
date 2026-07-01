@@ -6,6 +6,7 @@ import { execSync } from 'node:child_process';
 import { readlinkSync } from 'node:fs';
 import { platform } from 'node:os';
 import { basename } from 'node:path';
+import { pollDuration } from '../metrics';
 
 export type CwdReadStatus = 'ok' | 'not_found' | 'permission_denied' | 'timeout' | 'unknown';
 
@@ -192,7 +193,21 @@ function getCwdForPid(pid: number): CwdReadDiagnostic {
  * TUI:   `opencode [-s sessionId]`
  * Serve: `opencode serve ... --port PORT`
  */
-export function scanProcesses(): ProcessScanResult {
+let cachedScanResult: ProcessScanResult = {
+  processes: [],
+  servePorts: [],
+  liveDirectories: [],
+  liveSessionIds: [],
+  directSessionIds: [],
+  directoryProcessCounts: {},
+  cwdReadDiagnostics: [],
+  scanSucceeded: false,
+};
+
+const cwdCache = new Map<number, CwdReadDiagnostic>();
+
+export function runScan(): ProcessScanResult {
+  const start = process.hrtime();
   try {
     const psOutput = execSync('ps -eo pid,args 2>/dev/null', {
       encoding: 'utf-8',
@@ -201,12 +216,20 @@ export function scanProcesses(): ProcessScanResult {
 
     const processes: OpenCodeProcess[] = [];
     const seenPorts = new Set<number>();
+    const activePids = new Set<number>();
 
     for (const line of psOutput.split('\n')) {
       const parsed = parseOpenCodeProcessLine(line);
       if (!parsed) continue;
 
-      const cwdRead = getCwdForPid(parsed.pid);
+      activePids.add(parsed.pid);
+
+      let cwdRead = cwdCache.get(parsed.pid);
+      if (!cwdRead) {
+        cwdRead = getCwdForPid(parsed.pid);
+        cwdCache.set(parsed.pid, cwdRead);
+      }
+
       processes.push({
         pid: parsed.pid,
         cwd: cwdRead.cwd,
@@ -216,6 +239,12 @@ export function scanProcesses(): ProcessScanResult {
         isServe: parsed.isServe,
       });
       if (parsed.port !== undefined) seenPorts.add(parsed.port);
+    }
+
+    for (const cachedPid of cwdCache.keys()) {
+      if (!activePids.has(cachedPid)) {
+        cwdCache.delete(cachedPid);
+      }
     }
 
     const liveDirectories = [...new Set(processes.map((p) => p.cwd).filter((cwd): cwd is string => !!cwd))];
@@ -228,7 +257,7 @@ export function scanProcesses(): ProcessScanResult {
       .map((process) => process.cwdRead)
       .filter((diagnostic): diagnostic is CwdReadDiagnostic => !!diagnostic);
 
-    return {
+    const result = {
       processes,
       servePorts: [...seenPorts],
       liveDirectories,
@@ -238,8 +267,10 @@ export function scanProcesses(): ProcessScanResult {
       cwdReadDiagnostics,
       scanSucceeded: true,
     };
+    cachedScanResult = result;
+    return result;
   } catch {
-    return {
+    const result = {
       processes: [],
       servePorts: [],
       liveDirectories: [],
@@ -249,5 +280,47 @@ export function scanProcesses(): ProcessScanResult {
       cwdReadDiagnostics: [],
       scanSucceeded: false,
     };
+    cachedScanResult = result;
+    return result;
+  } finally {
+    const diff = process.hrtime(start);
+    const duration = diff[0] + diff[1] / 1e9;
+    try {
+      pollDuration.observe({ step: 'process_scan' }, duration);
+    } catch {
+      // Ignore metrics errors if not initialized or in testing
+    }
   }
+}
+
+let pollerInterval: ReturnType<typeof setInterval> | null = null;
+
+export function startBackgroundPoller(intervalMs = 5000) {
+  if (pollerInterval) return;
+  // Run once immediately
+  runScan();
+  pollerInterval = setInterval(() => {
+    runScan();
+  }, intervalMs);
+}
+
+export function stopBackgroundPoller() {
+  if (pollerInterval) {
+    clearInterval(pollerInterval);
+    pollerInterval = null;
+  }
+}
+
+export function scanProcesses(): ProcessScanResult {
+  if (!cachedScanResult.scanSucceeded && cachedScanResult.processes.length === 0) {
+    return runScan();
+  }
+  return cachedScanResult;
+}
+
+// Automatically start background scanning
+if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'test') {
+  setTimeout(() => {
+    startBackgroundPoller(5000);
+  }, 0);
 }

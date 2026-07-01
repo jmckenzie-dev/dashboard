@@ -24,6 +24,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
 import type Database from 'better-sqlite3';
+import { partCacheHits, pollDuration } from '../metrics';
 
 type DatabaseType = typeof Database;
 
@@ -168,76 +169,126 @@ function partActivityTime(part: OpenCodePartRow): number {
   return Math.max(part.time_created ?? 0, part.time_updated ?? 0);
 }
 
-function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
+const PART_CACHE_LIMIT = 10000;
+const partCache = new Map<string, CachedPart>();
+
+interface CachedPart {
+  id: string;
+  timeUpdated: number | null;
+  parsedData: any;
+  normalized: NormalizedPart;
+  message: AgentMessage | null;
+}
+
+function getOrParsePart(part: OpenCodePartRow): { parsedData: any; normalized: NormalizedPart | null; message: AgentMessage | null } {
+  const cached = partCache.get(part.id);
+  if (cached && cached.timeUpdated === part.time_updated) {
+    try {
+      partCacheHits.inc({ result: 'hit' });
+    } catch {}
+    return {
+      parsedData: cached.parsedData,
+      normalized: cached.normalized,
+      message: cached.message,
+    };
+  }
+
+  try {
+    partCacheHits.inc({ result: 'miss' });
+  } catch {}
+
+  let data: any;
+  try {
+    data = JSON.parse(part.data);
+  } catch {
+    return { parsedData: null, normalized: null, message: null };
+  }
+
+  const activeTime = partActivityTime(part);
+  const normalized: NormalizedPart = {
+    type: String(data.type ?? ''),
+    tool: data.tool != null ? String(data.tool) : undefined,
+    callID: data.callID ?? data.call_id,
+    status: data.state?.status != null ? String(data.state.status) : undefined,
+    reason: data.reason != null ? String(data.reason) : undefined,
+    time: activeTime,
+  };
+
+  let message: AgentMessage | null = null;
+  if (data.type === 'text' && typeof data.text === 'string' && data.text.trim()) {
+    message = {
+      id: part.id,
+      role: 'assistant',
+      content: data.text,
+      timestamp: toDate(activeTime)
+    };
+  } else if (data.type === 'reasoning' && typeof data.text === 'string' && data.text.trim()) {
+    message = {
+      id: part.id,
+      role: 'assistant',
+      content: data.text,
+      timestamp: toDate(activeTime)
+    };
+  } else if (data.type === 'tool') {
+    const tool = data.tool ? `tool:${data.tool}` : 'tool';
+    const s = data.state?.status ? ` status:${data.state.status}` : '';
+    const output = typeof data.state?.output === 'string' ? data.state.output.slice(0, 200) : '';
+    const text = `${tool}${s}${output ? ` output:${output}` : ''}`.trim();
+    if (text) {
+      message = {
+        id: part.id,
+        role: 'system',
+        content: text,
+        timestamp: toDate(activeTime)
+      };
+    }
+  }
+
+  const entry: CachedPart = {
+    id: part.id,
+    timeUpdated: part.time_updated,
+    parsedData: data,
+    normalized,
+    message,
+  };
+
+  partCache.set(part.id, entry);
+
+  if (partCache.size > PART_CACHE_LIMIT) {
+    const keys = partCache.keys();
+    for (let i = 0; i < 2000; i++) {
+      const key = keys.next().value;
+      if (key === undefined) break;
+      partCache.delete(key);
+    }
+  }
+
+  return { parsedData: data, normalized, message };
+}
+
+export function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
   const messages: AgentMessage[] = [];
   let lastPartTime: number | null = null;
 
   const normalized: NormalizedPart[] = [];
   for (const part of parts) {
-    let data: any;
-    try {
-      data = JSON.parse(part.data);
-    } catch {
-      continue;
-    }
-    const activeTime = partActivityTime(part);
+    const { normalized: norm } = getOrParsePart(part);
+    if (!norm) continue;
+
+    const activeTime = norm.time;
     if (!lastPartTime || activeTime > lastPartTime) {
       lastPartTime = activeTime;
     }
-    normalized.push({
-      type: String(data.type ?? ''),
-      tool: data.tool != null ? String(data.tool) : undefined,
-      callID: data.callID ?? data.call_id,
-      status: data.state?.status != null ? String(data.state.status) : undefined,
-      reason: data.reason != null ? String(data.reason) : undefined,
-      time: activeTime,
-    });
+    normalized.push(norm);
   }
 
   const { latestTool, latestStepReason, hasError, latestPartType, latestPartIsActiveTool } = analyzeParts(normalized);
 
   // Chronological pass for message extraction (text/reasoning/tool summaries).
   for (const part of [...parts].reverse()) {
-    let data: any;
-    try {
-      data = JSON.parse(part.data);
-    } catch {
-      continue;
-    }
-
-    if (data.type === 'text' && typeof data.text === 'string' && data.text.trim()) {
-      messages.push({
-        id: part.id,
-        role: 'assistant',
-        content: data.text,
-        timestamp: toDate(partActivityTime(part))
-      });
-      continue;
-    }
-
-    if (data.type === 'reasoning' && typeof data.text === 'string' && data.text.trim()) {
-      messages.push({
-        id: part.id,
-        role: 'assistant',
-        content: data.text,
-        timestamp: toDate(partActivityTime(part))
-      });
-      continue;
-    }
-
-    if (data.type === 'tool') {
-      const tool = data.tool ? `tool:${data.tool}` : 'tool';
-      const s = data.state?.status ? ` status:${data.state.status}` : '';
-      const output = typeof data.state?.output === 'string' ? data.state.output.slice(0, 200) : '';
-      const text = `${tool}${s}${output ? ` output:${output}` : ''}`.trim();
-      if (text) {
-        messages.push({
-          id: part.id,
-          role: 'system',
-          content: text,
-          timestamp: toDate(partActivityTime(part))
-        });
-      }
+    const { message } = getOrParsePart(part);
+    if (message) {
+      messages.push(message);
     }
   }
 
@@ -658,6 +709,8 @@ async function getSessionsViaSQLite(
     const DatabaseConstructor = await getSQLite();
     const db = new DatabaseConstructor(resolvedDbPath, { readonly: true, fileMustExist: true });
 
+    const startDb = process.hrtime();
+
     // Reference-style query: exclude archived + child sessions, no fixed low limit.
     // Gap §3.5 fix: remove LIMIT 50, add time_archived IS NULL filter.
     const sessions = db.prepare(`
@@ -668,17 +721,52 @@ async function getSessionsViaSQLite(
       LIMIT 200
     `).all() as OpenCodeSessionRow[];
 
+    // Consolidated parts query using window functions
+    const allParts = db.prepare(`
+      WITH ranked_parts AS (
+        SELECT id, session_id, message_id, time_created, time_updated, data,
+               ROW_NUMBER() OVER (
+                 PARTITION BY session_id
+                 ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
+               ) as rn
+        FROM part
+        WHERE session_id IN (
+          SELECT id FROM session WHERE time_archived IS NULL AND parent_id IS NULL
+          ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
+          LIMIT 200
+        )
+      )
+      SELECT id, session_id, message_id, time_created, time_updated, data
+      FROM ranked_parts
+      WHERE rn <= 80
+      ORDER BY session_id, rn ASC
+    `).all() as OpenCodePartRow[];
+
+    const dbDiff = process.hrtime(startDb);
+    const dbDuration = dbDiff[0] + dbDiff[1] / 1e9;
+    try {
+      pollDuration.observe({ step: 'db_query' }, dbDuration);
+    } catch {}
+
+    db.close();
+
+    // Map parts to their corresponding sessions in O(M) time
+    const startParse = process.hrtime();
+
+    const partsBySession = new Map<string, OpenCodePartRow[]>();
+    for (const part of allParts) {
+      let list = partsBySession.get(part.session_id);
+      if (!list) {
+        list = [];
+        partsBySession.set(part.session_id, list);
+      }
+      list.push(part);
+    }
+
     const candidates: SessionCandidate[] = [];
 
     for (const session of sessions) {
-      const parts = db.prepare(`
-        SELECT id, session_id, message_id, time_created, time_updated, data
-        FROM part
-        WHERE session_id = ?
-        ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
-        LIMIT 80
-      `).all(session.id) as OpenCodePartRow[];
-
+      const parts = partsBySession.get(session.id) ?? [];
       const parsed = parsePartData(parts);
       const lastTime = Math.max(parsed.lastPartTime ?? 0, session.time_created ?? 0, session.time_updated ?? 0);
       const lastActivity = toDate(lastTime);
@@ -761,7 +849,12 @@ async function getSessionsViaSQLite(
       });
     }
 
-    db.close();
+    const parseDiff = process.hrtime(startParse);
+    const parseDuration = parseDiff[0] + parseDiff[1] / 1e9;
+    try {
+      pollDuration.observe({ step: 'parse_inference' }, parseDuration);
+    } catch {}
+
     return applyLivenessDecisions(candidates, options.liveness, options.includeHidden);
   } catch (error) {
     console.error('OpenCode SQLite error:', error);
