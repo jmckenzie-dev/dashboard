@@ -26,16 +26,71 @@ import { join, sep } from 'node:path';
 import type Database from 'better-sqlite3';
 import { partCacheHits, pollDuration } from '../metrics';
 
-type DatabaseType = typeof Database;
+type DatabaseConstructor = typeof Database;
+type DatabaseInstance = InstanceType<DatabaseConstructor>;
 
-let sqlite3: DatabaseType | null = null;
+let sqlite3: DatabaseConstructor | null = null;
 
-async function getSQLite(): Promise<DatabaseType> {
+async function getSQLite(): Promise<DatabaseConstructor> {
   if (!sqlite3) {
     const module = await import('better-sqlite3');
-    sqlite3 = module.default || module as unknown as DatabaseType;
+    sqlite3 = (module.default || module) as unknown as DatabaseConstructor;
   }
   return sqlite3;
+}
+
+// Persistent DB connection — reused across poll cycles instead of opening
+// and closing on every tick. The path is tracked so a config change to
+// dbPath triggers a clean close+reopen.
+let dbHandle: DatabaseInstance | null = null;
+let dbHandlePath: string | null = null;
+const indexedDbPaths = new Set<string>();
+
+function ensureDashboardIndexes(dbPath: string): void {
+  if (indexedDbPaths.has(dbPath)) return;
+  const DatabaseConstructor = sqlite3!;
+  const db = new DatabaseConstructor(dbPath, { fileMustExist: true, timeout: 10000 });
+  try {
+    // Dashboard-owned indexes for the exact polling access patterns. OpenCode's
+    // stock indexes find rows by parent/session, but do not satisfy the
+    // activity ORDER BY, so SQLite was building temp B-trees every tick.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS dashboard_session_root_activity_idx
+      ON session (
+        COALESCE(time_updated, time_created) DESC,
+        time_created DESC,
+        id DESC
+      )
+      WHERE time_archived IS NULL AND parent_id IS NULL;
+
+      CREATE INDEX IF NOT EXISTS dashboard_part_session_activity_idx
+      ON part (
+        session_id,
+        COALESCE(time_updated, time_created) DESC,
+        time_created DESC,
+        id DESC
+      );
+    `);
+    indexedDbPaths.add(dbPath);
+  } finally {
+    db.close();
+  }
+}
+
+function getDb(dbPath: string): DatabaseInstance {
+  if (dbHandle && dbHandlePath === dbPath) {
+    return dbHandle;
+  }
+  // Path changed or first open.
+  if (dbHandle) {
+    try { dbHandle.close(); } catch {}
+    dbHandle = null;
+  }
+  ensureDashboardIndexes(dbPath);
+  const DatabaseConstructor = sqlite3!;
+  dbHandle = new DatabaseConstructor(dbPath, { readonly: true, fileMustExist: true, timeout: 5000 });
+  dbHandlePath = dbPath;
+  return dbHandle;
 }
 
 interface OpenCodeSessionRow {
@@ -170,6 +225,9 @@ function partActivityTime(part: OpenCodePartRow): number {
 }
 
 const PART_CACHE_LIMIT = 100000;
+const SESSION_METADATA_LIMIT = 200;
+const PART_SESSION_SCAN_LIMIT = 40;
+const PARTS_PER_SESSION_LIMIT = 80;
 const partCache = new Map<string, CachedPart>();
 
 interface CachedPart {
@@ -267,12 +325,16 @@ function getOrParsePart(part: OpenCodePartRow): { parsedData: any; normalized: N
 }
 
 export function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
-  const messages: AgentMessage[] = [];
+  // Single pass: extract normalized parts AND messages in one iteration.
+  // Parts arrive from the DB ordered newest→oldest (rn ASC where rn=1 is
+  // newest). We collect messages in that order, then reverse at the end for
+  // chronological display.
+  const messagesNewestFirst: AgentMessage[] = [];
   let lastPartTime: number | null = null;
 
   const normalized: NormalizedPart[] = [];
   for (const part of parts) {
-    const { normalized: norm } = getOrParsePart(part);
+    const { normalized: norm, message } = getOrParsePart(part);
     if (!norm) continue;
 
     const activeTime = norm.time;
@@ -280,19 +342,16 @@ export function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
       lastPartTime = activeTime;
     }
     normalized.push(norm);
+
+    if (message) {
+      messagesNewestFirst.push(message);
+    }
   }
 
   const { latestTool, latestStepReason, hasError, latestPartType, latestPartIsActiveTool } = analyzeParts(normalized);
 
-  // Chronological pass for message extraction (text/reasoning/tool summaries).
-  for (const part of [...parts].reverse()) {
-    const { message } = getOrParsePart(part);
-    if (message) {
-      messages.push(message);
-    }
-  }
-
-  const trimmed = messages.slice(-25);
+  // Reverse to chronological (oldest→newest) and take the last 25.
+  const trimmed = messagesNewestFirst.reverse().slice(-25);
   return {
     messages: trimmed,
     latestTool,
@@ -706,8 +765,8 @@ async function getSessionsViaSQLite(
   if (!resolvedDbPath) return [];
 
   try {
-    const DatabaseConstructor = await getSQLite();
-    const db = new DatabaseConstructor(resolvedDbPath, { readonly: true, fileMustExist: true });
+    await getSQLite();
+    const db = getDb(resolvedDbPath);
 
     const startDb = process.hrtime();
 
@@ -718,29 +777,41 @@ async function getSessionsViaSQLite(
       FROM session
       WHERE time_archived IS NULL AND parent_id IS NULL
       ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
-      LIMIT 200
+      LIMIT ${SESSION_METADATA_LIMIT}
     `).all() as OpenCodeSessionRow[];
 
-    // Consolidated parts query using window functions
-    const allParts = db.prepare(`
-      WITH ranked_parts AS (
-        SELECT id, session_id, message_id, time_created, time_updated, data,
-               ROW_NUMBER() OVER (
-                 PARTITION BY session_id
-                 ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
-               ) as rn
-        FROM part
-        WHERE session_id IN (
-          SELECT id FROM session WHERE time_archived IS NULL AND parent_id IS NULL
-          ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
-          LIMIT 200
+    const sessionIdsToScan = new Set<string>();
+    for (const session of sessions.slice(0, PART_SESSION_SCAN_LIMIT)) {
+      sessionIdsToScan.add(session.id);
+    }
+    for (const session of sessions) {
+      if (Object.prototype.hasOwnProperty.call(options.statusData, session.id)) sessionIdsToScan.add(session.id);
+      if (options.blocking.permissionsBySession.has(session.id)) sessionIdsToScan.add(session.id);
+      if (options.blocking.questionsBySession.has(session.id)) sessionIdsToScan.add(session.id);
+      if (options.liveness.liveSessionIds.has(session.id)) sessionIdsToScan.add(session.id);
+    }
+
+    // Consolidated parts query using window functions, limited to sessions that
+    // can plausibly affect the visible dashboard. We still read broad session
+    // metadata above for liveness allocation/hysteresis, but avoid pulling 80
+    // JSON blobs for every old hidden-stale session on every tick.
+    const allParts = sessionIdsToScan.size === 0
+      ? []
+      : db.prepare(`
+        WITH ranked_parts AS (
+          SELECT id, session_id, message_id, time_created, time_updated, data,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY session_id
+                   ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
+                 ) as rn
+          FROM part
+          WHERE session_id IN (${[...sessionIdsToScan].map(() => '?').join(',')})
         )
-      )
-      SELECT id, session_id, message_id, time_created, time_updated, data
-      FROM ranked_parts
-      WHERE rn <= 80
-      ORDER BY session_id, rn ASC
-    `).all() as OpenCodePartRow[];
+        SELECT id, session_id, message_id, time_created, time_updated, data
+        FROM ranked_parts
+        WHERE rn <= ${PARTS_PER_SESSION_LIMIT}
+        ORDER BY session_id, rn ASC
+      `).all(...sessionIdsToScan) as OpenCodePartRow[];
 
     const dbDiff = process.hrtime(startDb);
     const dbDuration = dbDiff[0] + dbDiff[1] / 1e9;
@@ -748,7 +819,8 @@ async function getSessionsViaSQLite(
       pollDuration.observe({ step: 'db_query' }, dbDuration);
     } catch {}
 
-    db.close();
+    // DB handle is persistent — do NOT close it here. It's reused across
+    // poll cycles for connection pooling. See getDb() above.
 
     // Map parts to their corresponding sessions in O(M) time
     const startParse = process.hrtime();
@@ -940,10 +1012,9 @@ async function getSessionDirectoryViaSQLite(dbPath: string, sessionId: string): 
   if (!resolvedDbPath) return null;
 
   try {
-    const DatabaseConstructor = await getSQLite();
-    const db = new DatabaseConstructor(resolvedDbPath, { readonly: true, fileMustExist: true });
+    await getSQLite();
+    const db = getDb(resolvedDbPath);
     const row = db.prepare('SELECT directory FROM session WHERE id = ?').get(sessionId) as { directory: string } | undefined;
-    db.close();
     return row?.directory ?? null;
   } catch (error) {
     console.error('OpenCode SQLite directory lookup error:', error);

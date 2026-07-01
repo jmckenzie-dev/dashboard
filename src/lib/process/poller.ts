@@ -205,6 +205,8 @@ let cachedScanResult: ProcessScanResult = {
 };
 
 const cwdCache = new Map<number, CwdReadDiagnostic>();
+let lastScanAt = 0;
+const DEFAULT_SCAN_MAX_AGE_MS = 10_000;
 
 export function runScan(): ProcessScanResult {
   const start = process.hrtime();
@@ -268,6 +270,7 @@ export function runScan(): ProcessScanResult {
       scanSucceeded: true,
     };
     cachedScanResult = result;
+    lastScanAt = Date.now();
     return result;
   } catch {
     const result = {
@@ -281,6 +284,7 @@ export function runScan(): ProcessScanResult {
       scanSucceeded: false,
     };
     cachedScanResult = result;
+    lastScanAt = Date.now();
     return result;
   } finally {
     const diff = process.hrtime(start);
@@ -312,15 +316,9 @@ export function stopBackgroundPoller() {
 }
 
 export function scanProcesses(): ProcessScanResult {
-  if (!cachedScanResult.scanSucceeded && cachedScanResult.processes.length === 0) {
+  const stale = Date.now() - lastScanAt > DEFAULT_SCAN_MAX_AGE_MS;
+  if (stale || (!cachedScanResult.scanSucceeded && cachedScanResult.processes.length === 0)) {
     return runScan();
   }
   return cachedScanResult;
-}
-
-// Automatically start background scanning
-if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'test') {
-  setTimeout(() => {
-    startBackgroundPoller(5000);
-  }, 0);
 }

@@ -32,3 +32,23 @@ export const sessionsTotal = new client.Gauge({
   labelNames: ['status'],
   registers: [registry],
 });
+
+export const snapshotDuration = new client.Histogram({
+  name: 'dashboard_snapshot_duration_seconds',
+  help: 'Duration of the shared snapshot poll cycle in seconds',
+  labelNames: ['phase'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+  registers: [registry],
+});
+
+export const snapshotSubscribers = new client.Gauge({
+  name: 'dashboard_snapshot_subscribers',
+  help: 'Number of SSE clients subscribed to the shared snapshot',
+  registers: [registry],
+});
+
+export const snapshotSkipped = new client.Counter({
+  name: 'dashboard_snapshot_skipped_total',
+  help: 'Number of snapshot ticks skipped because a previous tick was still running',
+  registers: [registry],
+});

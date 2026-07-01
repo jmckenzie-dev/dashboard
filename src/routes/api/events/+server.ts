@@ -1,86 +1,86 @@
 import type { RequestHandler } from './$types';
 import { loadConfig } from '$lib/config';
 import { checkAuth, requireAuth } from '$lib/auth';
-import { countStatuses, getAllSessions, onStatusTransition } from '$lib/agents';
 import { generateSummary } from '$lib/llm/summarizer';
-import { pollDuration, sseClientsActive, sessionsTotal } from '$lib/metrics';
+import { sseClientsActive } from '$lib/metrics';
+import { subscribe, subscribeTransitions, type SnapshotData } from '$lib/agents/snapshot';
+import type { AgentSession } from '$lib/agents/types';
 
 export const GET: RequestHandler = async (event) => {
   const config = await loadConfig();
-  
+
   if (config.auth.passwordHash && !await checkAuth(event)) {
     return requireAuth();
   }
-  
+
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
       let closed = false;
-      
+
       sseClientsActive.inc();
       let activeDecremented = false;
-      
-      const sendEvent = async (type: string, data: unknown) => {
-        const message = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
-        controller.enqueue(encoder.encode(message));
-      };
 
-      // One poll cycle: gather the snapshot and emit an `update` event.
-      // Errors are logged and swallowed so a single failing tick cannot tear
-      // down the stream.
-      const pollOnce = async () => {
-        const start = process.hrtime();
+      const sendEvent = (type: string, data: unknown) => {
+        if (closed) return;
         try {
-          const sessions = await getAllSessions();
-          const counts = countStatuses(sessions);
-
-          // Update active sessions status metrics
-          const allStatuses = ['working', 'blocked', 'blocked_permission', 'blocked_question', 'blocked_review', 'complete', 'idle', 'retry', 'error'];
-          for (const status of allStatuses) {
-            sessionsTotal.set({ status }, counts[status as keyof typeof counts] ?? 0);
-          }
-
-          // Only generate summaries for active sessions; idle/complete rely on
-          // the existing cache (TTL 10-30 min) to avoid LLM calls every tick.
-          // Messages are truncated server-side (last 5, 220 chars each).
-          const sessionsWithSummaries = await Promise.all(
-            sessions.slice(0, 20).map(async (session) => {
-              const needsSummary = session.status !== 'idle' && session.status !== 'complete';
-              return {
-                ...session,
-                summary: needsSummary
-                  ? await generateSummary(session.id, session.messages, false, session.status)
-                  : session.summary,
-                messages: session.messages.slice(-5).map((m) => ({
-                  ...m,
-                  content: m.content.slice(0, 220),
-                  timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp
-                })),
-                lastActivity: session.lastActivity.toISOString()
-              };
-            })
-          );
-
-          await sendEvent('update', { sessions: sessionsWithSummaries, counts });
+          const message = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+          controller.enqueue(encoder.encode(message));
         } catch (error) {
-          console.error('SSE poll error:', error);
-        } finally {
-          const diff = process.hrtime(start);
-          const duration = diff[0] + diff[1] / 1e9;
-          pollDuration.observe({ step: 'total' }, duration);
+          console.error('SSE send error:', error);
         }
       };
 
-      const unsubscribe = onStatusTransition(async (transition) => {
+      // Transform a raw snapshot into the wire format: generate summaries for
+      // active sessions, truncate messages, serialize dates. This work is
+      // per-client (each client may have different summary cache state), but
+      // the expensive getAllSessions() + SQLite + inference pipeline runs only
+      // once in the shared snapshot manager.
+      const formatSnapshot = async (data: SnapshotData) => {
+        const sessionsWithSummaries = await Promise.all(
+          data.sessions.slice(0, 20).map(async (session: AgentSession) => {
+            const needsSummary = session.status !== 'idle' && session.status !== 'complete';
+            return {
+              ...session,
+              summary: needsSummary
+                ? await generateSummary(session.id, session.messages, false, session.status)
+                : session.summary,
+              messages: session.messages.slice(-5).map((m) => ({
+                ...m,
+                content: m.content.slice(0, 220),
+                timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+              })),
+              lastActivity: session.lastActivity.toISOString(),
+            };
+          })
+        );
+
+        return { sessions: sessionsWithSummaries, counts: data.counts };
+      };
+
+      sendEvent('connected', { timestamp: new Date().toISOString() });
+
+      // Subscribe to the shared snapshot. The manager runs a SINGLE poll loop
+      // regardless of how many SSE clients are connected.
+      const unsubscribeSnapshot = subscribe(async (data) => {
+        if (closed) return;
         try {
-          await sendEvent('transition', transition);
+          const formatted = await formatSnapshot(data);
+          sendEvent('update', formatted);
         } catch (error) {
-          console.error('SSE transition emit error:', error);
+          console.error('SSE format/send error:', error);
         }
       });
-      
-      await sendEvent('connected', { timestamp: new Date().toISOString() });
-      
+
+      const unsubscribeTransitions = subscribeTransitions((transition) => {
+        sendEvent('transition', {
+          ...transition,
+          timestamp: transition.timestamp instanceof Date
+            ? transition.timestamp.toISOString()
+            : transition.timestamp,
+        });
+      });
+
       const keepAlive = setInterval(() => {
         if (closed) return;
         try {
@@ -90,47 +90,28 @@ export const GET: RequestHandler = async (event) => {
         }
       }, 15000);
 
-      // Self-scheduling non-overlapping poll loop. A new tick is only armed
-      // AFTER the previous tick fully settles, so slow opencode API responses
-      // can never cause overlapping snapshots that flicker the UI. Effective
-      // cadence is max(intervalMs, tickLatency); under load this degrades
-      // gracefully rather than corrupting each tick.
-      let pollTimer: ReturnType<typeof setTimeout> | null = null;
-      const scheduleNext = () => {
-        if (closed) return;
-        pollTimer = setTimeout(async () => {
-          pollTimer = null;
-          await pollOnce();
-          scheduleNext();
-        }, config.polling.intervalMs);
-      };
-      scheduleNext();
-      
       event.request.signal.addEventListener('abort', () => {
         if (!activeDecremented) {
           sseClientsActive.dec();
           activeDecremented = true;
         }
         closed = true;
-        if (pollTimer) {
-          clearTimeout(pollTimer);
-          pollTimer = null;
-        }
         clearInterval(keepAlive);
-        unsubscribe();
+        unsubscribeSnapshot();
+        unsubscribeTransitions();
         try {
           controller.close();
         } catch {}
       });
-    }
+    },
   });
-  
+
   return new Response(stream, {
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no'
-    }
+      'X-Accel-Buffering': 'no',
+    },
   });
 };

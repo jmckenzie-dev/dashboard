@@ -209,7 +209,7 @@ const hitsAfter1 = await getCacheMetric('hit');
 const missesAfter1 = await getCacheMetric('miss');
 
 assertEqual(missesAfter1 - missesBefore, 2, 'registers 2 cache misses on first parse');
-assertEqual(hitsAfter1 - hitsBefore, 2, 'registers 2 cache hits on reverse/double-parsing pass');
+assertEqual(hitsAfter1 - hitsBefore, 0, 'registers 0 cache hits on first single-pass parse');
 
 // Run again to hit cache
 const parsed2 = opencode.parsePartData([testPart1, testPart2]);
@@ -217,7 +217,7 @@ const hitsAfter2 = await getCacheMetric('hit');
 const missesAfter2 = await getCacheMetric('miss');
 
 assertEqual(missesAfter2 - missesAfter1, 0, 'registers 0 new cache misses');
-assertEqual(hitsAfter2 - hitsAfter1, 4, 'registers 4 cache hits on second execution (both forward and reverse passes hit cache)');
+assertEqual(hitsAfter2 - hitsAfter1, 2, 'registers 2 cache hits on second single-pass execution');
 
 // ----------------------------------------------------
 // TEST 3: DB Consolidation Query
