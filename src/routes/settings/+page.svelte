@@ -165,8 +165,8 @@
             id="polling-interval" 
             type="number" 
             bind:value={config.polling.intervalMs}
-            min="100"
-            max="10000"
+             min="1000"
+             max="60000"
           />
         </div>
       </section>

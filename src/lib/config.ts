@@ -85,7 +85,7 @@ function tomlStringify(obj: unknown, indent = 0): string {
   
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     if (value === null) {
-      lines.push(`${spaces}${key} = "null"`);
+      continue;
     } else if (typeof value === 'string') {
       const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
       lines.push(`${spaces}${key} = "${escaped}"`);
@@ -133,6 +133,16 @@ export async function loadConfig(): Promise<DashboardConfig> {
       gemini: { ...DEFAULT_CONFIG.agents.gemini, ...parsed.agents?.gemini }
     }
   };
+  
+  // Normalize notification configs: the legacy serializer wrote "null" as the
+  // string "null". Map it back to proper null so downstream checks work.
+  for (const key of ['blocked', 'complete'] as const) {
+    const nc = config.notifications[key];
+    if (nc) {
+      if (nc.skill === 'null') nc.skill = null;
+      if (nc.sound === 'null') nc.sound = null;
+    }
+  }
   
   // Expand paths
   config.tls.certPath = expandPath(config.tls.certPath);

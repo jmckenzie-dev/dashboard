@@ -47,6 +47,9 @@ export const PUT: RequestHandler = async (event) => {
   
   if (body.polling) {
     config.polling = { ...config.polling, ...body.polling };
+    if (typeof config.polling.intervalMs === 'number') {
+      config.polling.intervalMs = Math.max(1000, Math.min(60000, config.polling.intervalMs));
+    }
   }
   
   if (body.notifications) {
