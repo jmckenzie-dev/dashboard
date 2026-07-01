@@ -169,7 +169,7 @@ function partActivityTime(part: OpenCodePartRow): number {
   return Math.max(part.time_created ?? 0, part.time_updated ?? 0);
 }
 
-const PART_CACHE_LIMIT = 10000;
+const PART_CACHE_LIMIT = 100000;
 const partCache = new Map<string, CachedPart>();
 
 interface CachedPart {
