@@ -47,6 +47,9 @@ node scripts/test-process-poller.mjs
 echo "Running dashboard poller & database optimization tests..."
 node scripts/test-optimize-poller.mjs
 
+echo "Running API-first lastActivity self-test..."
+node scripts/test-api-first-activity.mjs
+
 if [[ "$run_long" == "true" ]]; then
   echo "No long-running dashboard tests are currently defined."
 fi

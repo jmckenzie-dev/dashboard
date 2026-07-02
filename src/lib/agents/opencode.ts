@@ -238,12 +238,32 @@ function partActivityTime(part: OpenCodePartRow): number {
   return Math.max(part.time_created ?? 0, part.time_updated ?? 0);
 }
 
+/**
+ * Compute lastActivityMs for the API-first path from session-row time and
+ * part-level time. Pure function — no I/O.
+ *
+ * @param sessionTimeMs  Session-row epoch ms (from created/updated).
+ * @param partTimeMs     Part-level epoch ms (from lastPartTime), or 0 if no parts.
+ * @param now            Current epoch ms (Date.now()).
+ * @returns              Milliseconds since last activity (0 = now).
+ */
+export function computeApiFirstLastActivityMs(
+  sessionTimeMs: number,
+  partTimeMs: number,
+  now: number,
+): number {
+  const lastActivity = Math.max(sessionTimeMs, partTimeMs);
+  const delta = now - lastActivity;
+  return delta >= 0 ? delta : 0;
+}
+
 const PART_CACHE_LIMIT = 100000;
 const SESSION_METADATA_LIMIT = 200;
 const PART_SESSION_SCAN_LIMIT = 40;
 const PARTS_PER_SESSION_LIMIT = 80;
 const API_ENRICHMENT_BOOTSTRAP_LIMIT = 20;
 const API_ENRICHMENT_PART_LIMIT = 12;
+const RECENT_ENRICHMENT_WINDOW_MS = 2 * 60 * 1000;
 const RECENT_SQLITE_SUPPLEMENT_MS = 10 * 60 * 1000;
 const partCache = new Map<string, CachedPart>();
 
@@ -832,8 +852,12 @@ async function getSessionsViaAPIStatusFirst(
       const changedSinceEnrichment = !!cached && cached.sessionActivity !== sessionActivity;
       const needsBootstrap = !cached && index < API_ENRICHMENT_BOOTSTRAP_LIMIT;
       const hasDirectLiveSignal = liveness.liveSessionIds.has(session.id) || Object.prototype.hasOwnProperty.call(statusData, session.id);
+      const sessionActivityMs = toEpochMs(sessionActivity);
+      const cachedPartActivityMs = cached ? toEpochMs(cached.parsed.lastPartTime ?? 0) : 0;
+      const bestActivityMs = Math.max(sessionActivityMs, cachedPartActivityMs);
+      const recentlyActive = Date.now() - bestActivityMs < RECENT_ENRICHMENT_WINDOW_MS;
 
-      if (busyWithoutApiBlock || changedSinceEnrichment || needsBootstrap || (!cached && hasDirectLiveSignal)) {
+      if (busyWithoutApiBlock || changedSinceEnrichment || needsBootstrap || (!cached && hasDirectLiveSignal) || recentlyActive) {
         enrichmentTargets.set(session.id, sessionActivity);
       }
     }
@@ -843,14 +867,16 @@ async function getSessionsViaAPIStatusFirst(
     const candidates: SessionCandidate[] = [];
 
     for (const session of sessions) {
-      const lastActivity = toDate(Math.max(session.time.created ?? 0, session.time.updated ?? 0));
-      const lastActivityMs = Date.now() - lastActivity.getTime();
+      const parsed = freshEnrichment.get(session.id) ?? apiSQLiteEnrichmentCache.get(session.id)?.parsed ?? null;
+      const sessionActivityMs = toEpochMs(Math.max(session.time.created ?? 0, session.time.updated ?? 0));
+      const partActivityMs = toEpochMs(parsed?.lastPartTime ?? 0);
+      const lastActivityMs = computeApiFirstLastActivityMs(sessionActivityMs, partActivityMs, Date.now());
+      const lastActivity = toDate(Math.max(sessionActivityMs, partActivityMs));
       const parentRaw = session.parent_id || session.parentId || session.parentID || null;
       const sessionStatus = statusData[session.id]?.type ?? null;
       const hasActiveInstance = Object.prototype.hasOwnProperty.call(statusData, session.id);
       const permIds = blocking.permissionsBySession.get(session.id) ?? [];
       const questIds = blocking.questionsBySession.get(session.id) ?? [];
-      const parsed = freshEnrichment.get(session.id) ?? apiSQLiteEnrichmentCache.get(session.id)?.parsed ?? null;
       const apiStatus = apiStatusFromSignals(sessionStatus, permIds.length > 0, questIds.length > 0);
       const status = applyReviewErrorEnrichment(apiStatus, parsed, permIds.length > 0, questIds.length > 0, lastActivityMs);
       const inferenceInput: OpencodeStatusInput = {

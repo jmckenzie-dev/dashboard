@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // Per-session debug dump for the dashboard.
 //
-// Calls the REAL production pipeline (`getOpenCodeSessionsWithDiagnostics` in
-// src/lib/agents/opencode.ts) — compiled to plain JS via tsc — and prints, per
-// OpenCode session, the full state the dashboard sees: identity, API signals,
-// the exact inputs to status inference, the inferred status/phase, liveness
-// candidate + decision, and the recent normalized parts. This is the tool for
-// answering "why is this session showing status X?" (e.g. an "Error" session
-// that should be idle/blocked).
+// Two modes:
+//
+// 1. Compile mode (default): Calls the REAL production pipeline
+//    (`getOpenCodeSessionsWithDiagnostics` in src/lib/agents/opencode.ts) —
+//    compiled to plain JS via tsc — and prints, per OpenCode session, the full
+//    state the dashboard sees.
+//
+// 2. Endpoint mode (--endpoint): Fetches GET /api/status/diagnose from a
+//    RUNNING dashboard instance instead of compiling the pipeline. Useful for
+//    inspecting a test dashboard's isolated view (including its own config).
 //
 // No pipeline logic is duplicated — this script only wires logging + formatting
 // around the real functions. Logs to ./logs/ alongside the other dashboard
@@ -19,6 +22,8 @@
 //   node scripts/dump-sessions.mjs --json                 # machine-readable (pipe to jq)
 //   node scripts/dump-sessions.mjs --no-hidden            # exclude hidden_stale sessions
 //   node scripts/dump-sessions.mjs --no-parts             # omit the raw parts block
+//   node scripts/dump-sessions.mjs --endpoint http://127.0.0.1:50001  # query a running dashboard
+//   node scripts/dump-sessions.mjs --endpoint http://127.0.0.1:50001 --auth admin:secret
 //   node scripts/dump-sessions.mjs --help
 
 import { createWriteStream, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -41,15 +46,19 @@ const filter = argValue('--session');
 const jsonMode = args.includes('--json');
 const includeHidden = !args.includes('--no-hidden');
 const showParts = !args.includes('--no-parts');
+const endpointUrl = argValue('--endpoint');
+const authCreds = argValue('--auth');
 if (args.includes('--help') || args.includes('-h')) {
   process.stdout.write(`Usage: node scripts/dump-sessions.mjs [options]
 
 Options:
-  --session <substr>   Filter sessions by raw id, opencode-<id>, or title (case-insensitive).
-  --json               Emit one JSON object on stdout (for jq/agents); disables log tee.
-  --no-hidden          Exclude sessions with visibilityReason 'hidden_stale'.
-  --no-parts           Omit the recent-parts block per session.
-  -h, --help           Show this help.
+  --session <substr>     Filter sessions by raw id, opencode-<id>, or title (case-insensitive).
+  --json                 Emit one JSON object on stdout (for jq/agents); disables log tee.
+  --no-hidden            Exclude sessions with visibilityReason 'hidden_stale'.
+  --no-parts             Omit the recent-parts block per session.
+  --endpoint <base-url>  Fetch from a running dashboard's /api/status/diagnose instead of compiling.
+  --auth <user:pass>     Basic auth credentials (required when the dashboard has a password hash).
+  -h, --help             Show this help.
 `);
   process.exit(0);
 }
@@ -128,7 +137,31 @@ function fmtParts(parts) {
 }
 
 async function main() {
-  const candidates = await getOpenCodeSessionsWithDiagnostics({ includeHidden: true });
+  let candidates;
+
+  if (endpointUrl) {
+    // Endpoint mode: fetch from a running dashboard's /api/status/diagnose
+    const base = endpointUrl.replace(/\/+$/, '');
+    const headers = {};
+    if (authCreds) {
+      headers['Authorization'] = 'Basic ' + Buffer.from(authCreds).toString('base64');
+    }
+    const res = await fetch(`${base}/api/status/diagnose`, { headers });
+    if (!res.ok) {
+      console.error(`Endpoint returned ${res.status} ${res.statusText}`);
+      if (logStream) logStream.end();
+      process.exit(1);
+    }
+    const raw = await res.json();
+    // Convert ISO date strings back to Date objects
+    candidates = raw.map((s) => ({
+      ...s,
+      lastActivity: new Date(s.lastActivity),
+    }));
+  } else {
+    // Compile mode: compile opencode.ts and run the real pipeline
+    candidates = await getOpenCodeSessionsWithDiagnostics({ includeHidden: true });
+  }
 
   // Filter
   let view = candidates;
@@ -145,10 +178,14 @@ async function main() {
   }
 
   // Resolve the DB path actually in use (for the summary header).
-  const config = await loadConfig();
-  const dbPath = config?.agents?.opencode?.dbPath
-    ? resolveOpenCodeDbPath(config.agents.opencode.dbPath)
-    : null;
+  let config = null;
+  let dbPath = null;
+  if (!endpointUrl) {
+    config = await loadConfig();
+    dbPath = config?.agents?.opencode?.dbPath
+      ? resolveOpenCodeDbPath(config.agents.opencode.dbPath)
+      : null;
+  }
 
   // Status counts over the (filtered) view.
   const counts = {};
@@ -160,6 +197,8 @@ async function main() {
         generated_at: new Date().toISOString(),
         filter: filter ?? null,
         include_hidden: includeHidden,
+        mode: endpointUrl ? 'endpoint' : 'compile',
+        endpoint: endpointUrl ?? null,
         db_path: dbPath,
         api_base: config?.agents?.opencode?.apiBase ?? null,
       },
@@ -188,6 +227,7 @@ async function main() {
 
   // Human mode
   console.log(`=== dashboard session dump (${new Date().toISOString()}) ===`);
+  console.log(`mode: ${endpointUrl ? `endpoint (${endpointUrl})` : 'compile'}`);
   console.log(`db_path: ${dbPath ?? '<unresolved>'}`);
   console.log(`api_base: ${config?.agents?.opencode?.apiBase ?? '<none>'}`);
   console.log(`filter: ${filter ?? '<none>'}  include_hidden: ${includeHidden}`);
