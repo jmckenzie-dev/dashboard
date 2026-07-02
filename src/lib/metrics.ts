@@ -52,3 +52,16 @@ export const snapshotSkipped = new client.Counter({
   help: 'Number of snapshot ticks skipped because a previous tick was still running',
   registers: [registry],
 });
+
+export const opencodeSnapshotMode = new client.Counter({
+  name: 'dashboard_opencode_snapshot_mode_total',
+  help: 'OpenCode snapshot source mode selected for a poll cycle',
+  labelNames: ['mode'],
+  registers: [registry],
+});
+
+export const opencodeSqliteEnrichmentSessions = new client.Counter({
+  name: 'dashboard_opencode_sqlite_enrichment_sessions_total',
+  help: 'Number of OpenCode sessions enriched via narrow SQLite review/error lookup',
+  registers: [registry],
+});

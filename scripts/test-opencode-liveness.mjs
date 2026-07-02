@@ -69,7 +69,11 @@ const compiledPath = existsSync(join(OUT_DIR, 'agents', 'opencode-liveness.js'))
   ? join(OUT_DIR, 'agents', 'opencode-liveness.js')
   : join(OUT_DIR, 'opencode-liveness.js');
 const liveness = require(compiledPath);
-const { allocateOpenCodeLiveness, hasOpenCodeStatusLiveness, RECENT_ACTIVE_FALLBACK_MS } = liveness;
+const {
+  allocateOpenCodeLiveness,
+  hasOpenCodeStatusLiveness,
+  RECENT_ACTIVE_FALLBACK_MS,
+} = liveness;
 
 const NOW = 2_000_000;
 function candidate(id, overrides = {}) {
@@ -79,6 +83,7 @@ function candidate(id, overrides = {}) {
     parentId: null,
     directory: '/repo/a',
     lastActivity: new Date(NOW - offset),
+    status: 'idle',
     hasStatusSignal: false,
     hasBlockingRequest: false,
     hasActiveTool: false,
@@ -109,13 +114,51 @@ assertEqual(hasOpenCodeStatusLiveness('retry'), true, 'retry status is direct li
 assertEqual(hasOpenCodeStatusLiveness('idle'), false, 'idle status is not direct liveness');
 
 let decisions = allocateOpenCodeLiveness([
-  candidate('a-old-error', { offset: 500_000 }),
+  candidate('a-old-open-tui', { offset: 7 * 24 * 60 * 60 * 1000 }),
+], { '/repo/a': 1 }, NOW);
+assertEqual(
+  decisions.get('a-old-open-tui').visibilityReason,
+  'cwd_allocated',
+  'old idle sessions remain visible when an OpenCode TUI is still open in that cwd',
+);
+
+decisions = allocateOpenCodeLiveness([
+  candidate('a-old-error', { offset: 500_000, status: 'error' }),
   candidate('a-new-idle', { offset: 100_000 }),
   candidate('a-newest-working', { offset: 10_000 }),
 ], { '/repo/a': 1 }, NOW);
 assertEqual(cwdAllocated(decisions), ['a-newest-working'], 'newest same-directory session receives cwd allocation');
 assertEqual(decisions.get('a-old-error').visibilityReason, 'hidden_stale', 'stale same-directory error session is hidden');
 assertEqual(decisions.get('a-new-idle').visibilityReason, 'hidden_stale', 'stale same-directory idle session is hidden');
+
+decisions = allocateOpenCodeLiveness([
+  candidate('a-recent-error', { offset: RECENT_ACTIVE_FALLBACK_MS - 1, status: 'error' }),
+], {}, NOW);
+assertEqual(
+  decisions.get('a-recent-error').visibilityReason,
+  'hidden_stale',
+  'recent error sessions do not receive recent_active_fallback liveness',
+);
+
+decisions = allocateOpenCodeLiveness([
+  candidate('a-newest-error', { offset: 1_000, status: 'error' }),
+  candidate('a-older-idle', { offset: 2_000, status: 'idle' }),
+], { '/repo/a': 1 }, NOW);
+assertEqual(
+  decisions.get('a-newest-error').visibilityReason,
+  'hidden_stale',
+  'error sessions do not receive cwd_allocated liveness even when newest',
+);
+assertEqual(cwdAllocated(decisions), ['a-older-idle'], 'cwd allocation skips errors and selects next eligible session');
+
+decisions = allocateOpenCodeLiveness([
+  candidate('a-error-direct', { offset: 900_000, status: 'error', hasProcessSessionId: true }),
+], {}, NOW);
+assertEqual(
+  decisions.get('a-error-direct').visibilityReason,
+  'process_session_id',
+  'direct process signal still keeps an error-status session visible',
+);
 
 decisions = allocateOpenCodeLiveness([
   candidate('a-old-direct', { offset: 900_000, hasProcessSessionId: true }),
@@ -180,6 +223,7 @@ for (let seed = 1; seed <= 200; seed++) {
       hasBlockingRequest: rand() < 0.08,
       hasActiveTool: rand() < 0.10,
       hasProcessSessionId: rand() < 0.10,
+      status: rand() < 0.18 ? 'error' : 'idle',
     }));
   }
   const directoryAllocationCounts = Object.fromEntries(directories.map((directory) => [directory, sampleInt(rand, 4)]));
@@ -208,7 +252,12 @@ for (let seed = 1; seed <= 200; seed++) {
     }
   }
   for (const directory of directories) {
-    const eligible = candidates.filter((c) => c.directory === directory && !c.parentId && !hasDirectSignal(c));
+    const eligible = candidates.filter((c) =>
+      c.directory === directory
+      && !c.parentId
+      && !hasDirectSignal(c)
+      && c.status !== 'error',
+    );
     const allocatedInDirectory = eligible.filter((c) => allocated.has(c.id));
     const expectedAllocationLimit = Math.min(directoryAllocationCounts[directory], eligible.length);
     propertyChecks += 1;

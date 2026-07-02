@@ -11,6 +11,7 @@ import {
   analyzeParts,
   inferOpencodeStatus,
   inferPhase,
+  WORKING_GRACE_MS,
 } from '../status/inference';
 import type {
   LatestToolInfo,
@@ -24,7 +25,12 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
 import type Database from 'better-sqlite3';
-import { partCacheHits, pollDuration } from '../metrics';
+import {
+  opencodeSnapshotMode,
+  opencodeSqliteEnrichmentSessions,
+  partCacheHits,
+  pollDuration,
+} from '../metrics';
 
 type DatabaseConstructor = typeof Database;
 type DatabaseInstance = InstanceType<DatabaseConstructor>;
@@ -140,6 +146,13 @@ interface ParsedPartData {
   normalizedParts: NormalizedPart[];
 }
 
+interface ApiSQLiteEnrichment {
+  sessionActivity: number;
+  parsed: ParsedPartData;
+}
+
+const apiSQLiteEnrichmentCache = new Map<string, ApiSQLiteEnrichment>();
+
 // Live-API-only blocking signals, keyed by session id.
 interface BlockingRequests {
   permissionsBySession: Map<string, string[]>;
@@ -181,6 +194,7 @@ export interface SessionDiagnostic {
     hasBlockingRequest: boolean;
     hasActiveTool: boolean;
     hasProcessSessionId: boolean;
+    status: AgentStatus;
   };
   parts: NormalizedPart[];
 }
@@ -228,6 +242,9 @@ const PART_CACHE_LIMIT = 100000;
 const SESSION_METADATA_LIMIT = 200;
 const PART_SESSION_SCAN_LIMIT = 40;
 const PARTS_PER_SESSION_LIMIT = 80;
+const API_ENRICHMENT_BOOTSTRAP_LIMIT = 20;
+const API_ENRICHMENT_PART_LIMIT = 12;
+const RECENT_SQLITE_SUPPLEMENT_MS = 10 * 60 * 1000;
 const partCache = new Map<string, CachedPart>();
 
 interface CachedPart {
@@ -364,6 +381,111 @@ export function parsePartData(parts: OpenCodePartRow[]): ParsedPartData {
   };
 }
 
+function apiStatusFromSignals(
+  sessionStatus: OpenCodeSessionStatus | null,
+  hasPermission: boolean,
+  hasQuestion: boolean,
+): AgentStatus {
+  if (hasPermission) return 'blocked_permission';
+  if (hasQuestion) return 'blocked_question';
+  if (sessionStatus === 'retry') return 'retry';
+  if (sessionStatus === 'busy') return 'working';
+  return 'idle';
+}
+
+function applyReviewErrorEnrichment(
+  status: AgentStatus,
+  parsed: ParsedPartData | null,
+  hasPermission: boolean,
+  hasQuestion: boolean,
+  lastActivityMs: number,
+): AgentStatus {
+  if (!parsed || hasPermission || hasQuestion) return status;
+
+  const toolName = parsed.latestTool?.tool ?? '';
+  const toolActive = parsed.latestTool?.active === true;
+  if ((toolName === 'submit_plan' || toolName === 'plan_exit') && toolActive) {
+    return 'blocked_review';
+  }
+
+  if (parsed.hasError) return 'error';
+  if (status === 'idle') {
+    if (toolActive && toolName !== 'question') return 'working';
+    if (lastActivityMs < WORKING_GRACE_MS) return 'working';
+  }
+  return status;
+}
+
+function evictApiSQLiteEnrichmentCache(seenIds: Set<string>): void {
+  for (const id of apiSQLiteEnrichmentCache.keys()) {
+    if (!seenIds.has(id)) apiSQLiteEnrichmentCache.delete(id);
+  }
+  while (apiSQLiteEnrichmentCache.size > SESSION_METADATA_LIMIT) {
+    const oldest = apiSQLiteEnrichmentCache.keys().next();
+    if (oldest.done) break;
+    apiSQLiteEnrichmentCache.delete(oldest.value);
+  }
+}
+
+async function getApiSQLiteEnrichment(
+  dbPath: string | null | undefined,
+  sessionActivityById: Map<string, number>,
+): Promise<Map<string, ParsedPartData>> {
+  if (!dbPath || sessionActivityById.size === 0) return new Map();
+  const resolvedDbPath = resolveOpenCodeDbPath(dbPath);
+  if (!resolvedDbPath) return new Map();
+
+  try {
+    await getSQLite();
+    const db = getDb(resolvedDbPath);
+    const startDb = process.hrtime();
+    const sessionIds = [...sessionActivityById.keys()];
+    const rows = db.prepare(`
+      WITH ranked_parts AS (
+        SELECT id, session_id, message_id, time_created, time_updated, data,
+               ROW_NUMBER() OVER (
+                 PARTITION BY session_id
+                 ORDER BY COALESCE(time_updated, time_created) DESC, time_created DESC, id DESC
+               ) as rn
+        FROM part
+        WHERE session_id IN (${sessionIds.map(() => '?').join(',')})
+      )
+      SELECT id, session_id, message_id, time_created, time_updated, data
+      FROM ranked_parts
+      WHERE rn <= ${API_ENRICHMENT_PART_LIMIT}
+      ORDER BY session_id, rn ASC
+    `).all(...sessionIds) as OpenCodePartRow[];
+
+    const dbDiff = process.hrtime(startDb);
+    try {
+      pollDuration.observe({ step: 'sqlite_enrichment' }, dbDiff[0] + dbDiff[1] / 1e9);
+      opencodeSqliteEnrichmentSessions.inc(sessionIds.length);
+    } catch {}
+
+    const partsBySession = new Map<string, OpenCodePartRow[]>();
+    for (const row of rows) {
+      let parts = partsBySession.get(row.session_id);
+      if (!parts) {
+        parts = [];
+        partsBySession.set(row.session_id, parts);
+      }
+      parts.push(row);
+    }
+
+    const result = new Map<string, ParsedPartData>();
+    for (const sessionId of sessionIds) {
+      const parsed = parsePartData(partsBySession.get(sessionId) ?? []);
+      const sessionActivity = sessionActivityById.get(sessionId) ?? 0;
+      apiSQLiteEnrichmentCache.set(sessionId, { sessionActivity, parsed });
+      result.set(sessionId, parsed);
+    }
+    return result;
+  } catch (error) {
+    console.error('OpenCode SQLite enrichment error:', error);
+    return new Map();
+  }
+}
+
 function statusBlockReason(status: AgentStatus): BlockReason | null {
   return blockReasonOf(status);
 }
@@ -373,7 +495,7 @@ function getOpenCodeAPIOptions(config: Awaited<ReturnType<typeof loadConfig>>): 
   const username = agentConfig.username || process.env.OPENCODE_SERVER_USERNAME;
   const password = agentConfig.password || process.env.OPENCODE_SERVER_PASSWORD;
   const directory = agentConfig.directory || process.env.OPENCODE_DIRECTORY || '/';
-  const headers: Record<string, string> = { 'x-opencode-directory': directory };
+  const headers: Record<string, string> = {};
 
   if (username && password) {
     headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
@@ -417,6 +539,30 @@ async function checkAPIServer(apiBase: string, options: OpenCodeAPIOptions): Pro
   } catch {
     return false;
   }
+}
+
+function getOpenCodeApiBaseCandidates(apiBase: string): string[] {
+  const candidates = [apiBase];
+  try {
+    const url = new URL(apiBase);
+    if (url.hostname === 'host.containers.internal') {
+      url.hostname = '127.0.0.1';
+      candidates.push(url.toString().replace(/\/$/, ''));
+    }
+  } catch {
+    // Leave invalid URLs to the normal checkAPIServer failure path.
+  }
+  return candidates;
+}
+
+async function resolveReachableOpenCodeApiBase(
+  apiBase: string,
+  options: OpenCodeAPIOptions,
+): Promise<string | null> {
+  for (const candidate of getOpenCodeApiBaseCandidates(apiBase)) {
+    if (await checkAPIServer(candidate, options)) return candidate;
+  }
+  return null;
 }
 
 async function getSessionStatusData(
@@ -577,6 +723,223 @@ function applyLivenessDecisions(
     : sessions.filter((session) => session.visibilityReason !== 'hidden_stale');
 }
 
+export function rawOpenCodeSessionId(id: string): string {
+  return id.replace(/^opencode-/, '');
+}
+
+export function liveSupplementSessionIds(
+  apiSessions: AgentSession[],
+  statusData: Record<string, OpenCodeSessionStatusResponse>,
+  blocking: BlockingRequests,
+  liveness: InstanceLiveness,
+): Set<string> {
+  const apiIds = new Set(apiSessions.map((session) => rawOpenCodeSessionId(session.id)));
+  const wanted = new Set<string>();
+
+  for (const id of liveness.liveSessionIds) wanted.add(id);
+  for (const id of Object.keys(statusData)) wanted.add(id);
+  for (const id of blocking.permissionsBySession.keys()) wanted.add(id);
+  for (const id of blocking.questionsBySession.keys()) wanted.add(id);
+
+  for (const id of [...wanted]) {
+    if (apiIds.has(id)) wanted.delete(id);
+  }
+
+  return wanted;
+}
+
+export function isRecentSQLiteSupplement(session: AgentSession, now = Date.now()): boolean {
+  return now - session.lastActivity.getTime() <= RECENT_SQLITE_SUPPLEMENT_MS;
+}
+
+async function getSQLiteLiveSupplements(
+  dbPath: string | undefined,
+  existingIds: Set<string>,
+  wantedIds: Set<string>,
+  options: OpenCodeSQLiteOptions,
+): Promise<AgentSession[]> {
+  const liveDirectories = new Set(
+    Object.entries(options.liveness.directoryAllocationCounts)
+      .filter(([, count]) => count > 0)
+      .map(([directory]) => directory),
+  );
+  if (!dbPath) return [];
+
+  const sqliteCandidates = await getSessionsViaSQLite(dbPath, {
+    ...options,
+    includeHidden: true,
+  });
+  const supplements = sqliteCandidates.filter((session) => {
+    const rawId = rawOpenCodeSessionId(session.id);
+    if (existingIds.has(rawId)) return false;
+    if (wantedIds.has(rawId)) return true;
+    if (isRecentSQLiteSupplement(session)) return true;
+    return !session.parentId
+      && !!session.directory
+      && liveDirectories.has(session.directory);
+  });
+
+  return options.includeHidden
+    ? supplements
+    : supplements.filter((session) => session.visibilityReason !== 'hidden_stale');
+}
+
+interface APIFirstSessionMetadata {
+  id: string;
+  parent_id?: string | null;
+  parentId?: string | null;
+  parentID?: string | null;
+  title: string;
+  directory: string;
+  time: { created: number; updated: number };
+}
+
+async function getAPIFirstSessionMetadata(
+  apiBase: string,
+  options: OpenCodeAPIOptions,
+): Promise<APIFirstSessionMetadata[]> {
+  const response = await fetch(`${apiBase}/session`, {
+    headers: options.headers,
+  });
+  if (!response.ok) return [];
+  return response.json() as Promise<APIFirstSessionMetadata[]>;
+}
+
+async function getSessionsViaAPIStatusFirst(
+  apiBase: string,
+  options: OpenCodeAPIOptions,
+  statusData: Record<string, OpenCodeSessionStatusResponse>,
+  blocking: BlockingRequests,
+  liveness: InstanceLiveness,
+  includeHidden: boolean,
+  dbPath?: string,
+  captureDiagnostics?: boolean,
+): Promise<AgentSession[]> {
+  try {
+    const sessions = await getAPIFirstSessionMetadata(apiBase, options);
+    if (sessions.length === 0) return [];
+
+    const seenIds = new Set<string>();
+    const enrichmentTargets = new Map<string, number>();
+    for (const [index, session] of sessions.entries()) {
+      seenIds.add(session.id);
+      const sessionStatus = statusData[session.id]?.type ?? null;
+      const permIds = blocking.permissionsBySession.get(session.id) ?? [];
+      const questIds = blocking.questionsBySession.get(session.id) ?? [];
+      const sessionActivity = Math.max(session.time.created ?? 0, session.time.updated ?? 0);
+      const cached = apiSQLiteEnrichmentCache.get(session.id);
+      const busyWithoutApiBlock = sessionStatus === 'busy' && permIds.length === 0 && questIds.length === 0;
+      const changedSinceEnrichment = !!cached && cached.sessionActivity !== sessionActivity;
+      const needsBootstrap = !cached && index < API_ENRICHMENT_BOOTSTRAP_LIMIT;
+      const hasDirectLiveSignal = liveness.liveSessionIds.has(session.id) || Object.prototype.hasOwnProperty.call(statusData, session.id);
+
+      if (busyWithoutApiBlock || changedSinceEnrichment || needsBootstrap || (!cached && hasDirectLiveSignal)) {
+        enrichmentTargets.set(session.id, sessionActivity);
+      }
+    }
+
+    evictApiSQLiteEnrichmentCache(seenIds);
+    const freshEnrichment = await getApiSQLiteEnrichment(dbPath, enrichmentTargets);
+    const candidates: SessionCandidate[] = [];
+
+    for (const session of sessions) {
+      const lastActivity = toDate(Math.max(session.time.created ?? 0, session.time.updated ?? 0));
+      const lastActivityMs = Date.now() - lastActivity.getTime();
+      const parentRaw = session.parent_id || session.parentId || session.parentID || null;
+      const sessionStatus = statusData[session.id]?.type ?? null;
+      const hasActiveInstance = Object.prototype.hasOwnProperty.call(statusData, session.id);
+      const permIds = blocking.permissionsBySession.get(session.id) ?? [];
+      const questIds = blocking.questionsBySession.get(session.id) ?? [];
+      const parsed = freshEnrichment.get(session.id) ?? apiSQLiteEnrichmentCache.get(session.id)?.parsed ?? null;
+      const apiStatus = apiStatusFromSignals(sessionStatus, permIds.length > 0, questIds.length > 0);
+      const status = applyReviewErrorEnrichment(apiStatus, parsed, permIds.length > 0, questIds.length > 0, lastActivityMs);
+      const inferenceInput: OpencodeStatusInput = {
+        sessionStatus,
+        latestTool: parsed?.latestTool ?? null,
+        latestStepReason: parsed?.latestStepReason ?? null,
+        hasPermission: permIds.length > 0,
+        hasQuestion: questIds.length > 0,
+        lastActivityMs,
+        hasError: parsed?.hasError ?? false,
+      };
+      const phase = parsed
+        ? inferPhase(status, parsed.latestPartType, parsed.latestPartIsActiveTool, parsed.latestTool)
+        : status === 'idle'
+          ? 'idle'
+          : (status === 'error' || statusBlockReason(status) !== null)
+            ? 'blocked'
+            : undefined;
+      const blockReason = statusBlockReason(status);
+      const blockingRequestIds = blockReason === 'permission'
+        ? permIds
+        : blockReason === 'question'
+          ? questIds
+          : [];
+      const livenessCandidate = {
+        id: session.id,
+        parentId: parentRaw,
+        directory: session.directory,
+        lastActivity,
+        hasStatusSignal: hasOpenCodeStatusLiveness(sessionStatus),
+        hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
+        hasActiveTool: parsed?.latestTool?.active === true,
+        hasProcessSessionId: liveness.liveSessionIds.has(session.id),
+        status,
+      };
+      const agentSession: AgentSession = {
+        id: `opencode-${session.id}`,
+        parentId: parentRaw ? `opencode-${parentRaw}` : undefined,
+        type: 'opencode',
+        name: session.title || 'Untitled Session',
+        summary: '',
+        status,
+        phase,
+        directory: session.directory,
+        lastActivity,
+        messages: parsed?.messages ?? [],
+        canSendInput: true,
+        isActiveInstance: hasActiveInstance,
+        blockReason,
+        blockingRequestIds: blockingRequestIds.length > 0 ? blockingRequestIds : undefined,
+      };
+
+      if (captureDiagnostics) {
+        (agentSession as DiagnosticAgentSession).diagnostic = {
+          sessionStatus,
+          hasActiveInstance,
+          permIds,
+          questIds,
+          latestTool: parsed?.latestTool ?? null,
+          latestStepReason: parsed?.latestStepReason ?? null,
+          hasError: parsed?.hasError ?? false,
+          latestPartType: parsed?.latestPartType ?? null,
+          latestPartIsActiveTool: parsed?.latestPartIsActiveTool ?? false,
+          lastActivityMs,
+          inferenceInput,
+          livenessCandidate: {
+            hasStatusSignal: livenessCandidate.hasStatusSignal,
+            hasBlockingRequest: livenessCandidate.hasBlockingRequest,
+            hasActiveTool: livenessCandidate.hasActiveTool,
+            hasProcessSessionId: livenessCandidate.hasProcessSessionId,
+            status: livenessCandidate.status,
+          },
+          parts: parsed?.normalizedParts ?? [],
+        };
+      }
+
+      candidates.push({
+        session: agentSession,
+        liveness: livenessCandidate,
+      });
+    }
+
+    return applyLivenessDecisions(candidates, liveness, includeHidden);
+  } catch (error) {
+    console.error('OpenCode API status-first error:', error);
+    return [];
+  }
+}
+
 async function getSessionsViaAPI(
   apiBase: string,
   options: OpenCodeAPIOptions,
@@ -596,6 +959,7 @@ async function getSessionsViaAPI(
       id: string;
       parent_id?: string | null;
       parentId?: string | null;
+      parentID?: string | null;
       title: string;
       directory: string;
       time: { created: number; updated: number };
@@ -606,7 +970,7 @@ async function getSessionsViaAPI(
     for (const [index, session] of sessions.entries()) {
       const lastActivity = toDate(Math.max(session.time.created ?? 0, session.time.updated ?? 0));
       const lastActivityMs = Date.now() - lastActivity.getTime();
-      const parentRaw = session.parent_id || session.parentId || null;
+      const parentRaw = session.parent_id || session.parentId || session.parentID || null;
       const sessionStatus = statusData[session.id]?.type ?? null;
       const hasActiveInstance = Object.prototype.hasOwnProperty.call(statusData, session.id);
       let messages: AgentMessage[] = [];
@@ -685,7 +1049,8 @@ async function getSessionsViaAPI(
         lastActivityMs,
         hasError,
       };
-      const status = inferOpencodeStatus(inferenceInput);
+      const inferredStatus = inferOpencodeStatus(inferenceInput);
+      const status = inferredStatus === 'complete' ? 'idle' : inferredStatus;
       const phase = inferPhase(status, latestPartType, latestPartIsActiveTool, latestTool);
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
@@ -702,6 +1067,7 @@ async function getSessionsViaAPI(
         hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
         hasActiveTool: latestTool?.active === true,
         hasProcessSessionId: liveness.liveSessionIds.has(session.id),
+        status,
       };
       const agentSession: AgentSession = {
         id: `opencode-${session.id}`,
@@ -739,6 +1105,7 @@ async function getSessionsViaAPI(
             hasBlockingRequest: livenessCandidate.hasBlockingRequest,
             hasActiveTool: livenessCandidate.hasActiveTool,
             hasProcessSessionId: livenessCandidate.hasProcessSessionId,
+            status: livenessCandidate.status,
           },
           parts: normalized,
         };
@@ -857,7 +1224,8 @@ async function getSessionsViaSQLite(
         lastActivityMs,
         hasError: parsed.hasError,
       };
-      const status = inferOpencodeStatus(inferenceInput);
+      const inferredStatus = inferOpencodeStatus(inferenceInput);
+      const status = inferredStatus === 'complete' ? 'idle' : inferredStatus;
       const phase = inferPhase(status, parsed.latestPartType, parsed.latestPartIsActiveTool, parsed.latestTool);
       const blockReason = statusBlockReason(status);
       const blockingRequestIds = blockReason === 'permission'
@@ -874,6 +1242,7 @@ async function getSessionsViaSQLite(
         hasBlockingRequest: permIds.length > 0 || questIds.length > 0,
         hasActiveTool: parsed.latestTool?.active === true,
         hasProcessSessionId: options.liveness.liveSessionIds.has(session.id),
+        status,
       };
       const agentSession: AgentSession = {
         id: `opencode-${session.id}`,
@@ -910,6 +1279,7 @@ async function getSessionsViaSQLite(
             hasBlockingRequest: livenessCandidate.hasBlockingRequest,
             hasActiveTool: livenessCandidate.hasActiveTool,
             hasProcessSessionId: livenessCandidate.hasProcessSessionId,
+            status: livenessCandidate.status,
           },
           parts: parsed.normalizedParts,
         };
@@ -947,11 +1317,13 @@ export async function getOpenCodeSessions(
   const processScan = scanProcesses();
 
   let apiAvailable = false;
+  let apiBase: string | null = null;
   let options: OpenCodeAPIOptions | null = null;
 
   if (agentConfig.apiBase) {
     options = getOpenCodeAPIOptions(config);
-    apiAvailable = await checkAPIServer(agentConfig.apiBase, options);
+    apiBase = await resolveReachableOpenCodeApiBase(agentConfig.apiBase, options);
+    apiAvailable = apiBase !== null;
   }
 
   // Fetch the live-API-only signals once and share them across both paths.
@@ -966,10 +1338,39 @@ export async function getOpenCodeSessions(
     liveSessionIds: new Set(processScan.directSessionIds),
     directoryAllocationCounts: getDirectoryAllocationCounts(processScan),
   };
-  if (apiAvailable && options && agentConfig.apiBase) {
-    statusData = await getSessionStatusData(agentConfig.apiBase, options);
-    blocking = await getBlockingRequests(agentConfig.apiBase, options);
-    liveness = await getInstanceLiveness(agentConfig.apiBase, options, apiAvailable, processScan);
+  if (apiAvailable && options && apiBase) {
+    statusData = await getSessionStatusData(apiBase, options);
+    blocking = await getBlockingRequests(apiBase, options);
+    liveness = await getInstanceLiveness(apiBase, options, apiAvailable, processScan);
+  }
+
+  if (apiBase && apiAvailable && options) {
+    const apiSessions = await getSessionsViaAPIStatusFirst(
+      apiBase,
+      options,
+      statusData,
+      blocking,
+      liveness,
+      includeHidden,
+      agentConfig.dbPath,
+      captureDiagnostics,
+    );
+    if (apiSessions.length > 0) {
+      const apiIds = new Set(apiSessions.map((session) => rawOpenCodeSessionId(session.id)));
+      const supplementIds = liveSupplementSessionIds(apiSessions, statusData, blocking, liveness);
+      const supplements = await getSQLiteLiveSupplements(agentConfig.dbPath, apiIds, supplementIds, {
+        canSendInput: apiAvailable,
+        statusData,
+        blocking,
+        liveness,
+        includeHidden,
+        captureDiagnostics,
+      });
+      try {
+        opencodeSnapshotMode.inc({ mode: 'api_first' });
+      } catch {}
+      return [...apiSessions, ...supplements];
+    }
   }
 
   if (agentConfig.dbPath) {
@@ -983,12 +1384,18 @@ export async function getOpenCodeSessions(
     });
 
     if (sqliteSessions.length > 0) {
+      try {
+        opencodeSnapshotMode.inc({ mode: captureDiagnostics ? 'diagnostic_sqlite' : 'sqlite_fallback' });
+      } catch {}
       return sqliteSessions;
     }
   }
 
-  if (agentConfig.apiBase && apiAvailable && options) {
-    return getSessionsViaAPI(agentConfig.apiBase, options, statusData, blocking, liveness, includeHidden, captureDiagnostics);
+  if (apiBase && apiAvailable && options) {
+    try {
+      opencodeSnapshotMode.inc({ mode: 'api_messages_fallback' });
+    } catch {}
+    return getSessionsViaAPI(apiBase, options, statusData, blocking, liveness, includeHidden, captureDiagnostics);
   }
 
   return [];
@@ -1043,9 +1450,11 @@ async function getSessionDirectoryViaAPI(
 export async function sendOpenCodeMessage(sessionId: string, message: string): Promise<boolean> {
   const config = await loadConfig();
   const agentConfig = config.agents.opencode;
-  const apiBase = agentConfig.apiBase;
+  const configuredApiBase = agentConfig.apiBase;
   const options = getOpenCodeAPIOptions(config);
   
+  if (!configuredApiBase) return false;
+  const apiBase = await resolveReachableOpenCodeApiBase(configuredApiBase, options);
   if (!apiBase) return false;
   
   try {
@@ -1078,8 +1487,10 @@ export async function sendOpenCodeMessage(sessionId: string, message: string): P
 
 export function isAPIModeAvailable(): Promise<boolean> {
   return loadConfig().then(config => {
-    if (!config.agents.opencode.apiBase) return Promise.resolve(false);
-    return checkAPIServer(config.agents.opencode.apiBase, getOpenCodeAPIOptions(config));
+    const apiBase = config.agents.opencode.apiBase;
+    if (!apiBase) return Promise.resolve(false);
+    return resolveReachableOpenCodeApiBase(apiBase, getOpenCodeAPIOptions(config))
+      .then((reachable) => reachable !== null);
   });
 }
 
@@ -1090,9 +1501,11 @@ export async function replyOpenCodePermission(
   reply: 'once' | 'always' | 'reject',
 ): Promise<boolean> {
   const config = await loadConfig();
-  const apiBase = config.agents.opencode.apiBase;
-  if (!apiBase) return false;
+  const configuredApiBase = config.agents.opencode.apiBase;
+  if (!configuredApiBase) return false;
   const options = getOpenCodeAPIOptions(config);
+  const apiBase = await resolveReachableOpenCodeApiBase(configuredApiBase, options);
+  if (!apiBase) return false;
 
   try {
     const response = await fetch(`${apiBase}/permission/${requestId}/reply`, {
@@ -1114,9 +1527,11 @@ export async function replyOpenCodeQuestion(
   answers: string[][],
 ): Promise<boolean> {
   const config = await loadConfig();
-  const apiBase = config.agents.opencode.apiBase;
-  if (!apiBase) return false;
+  const configuredApiBase = config.agents.opencode.apiBase;
+  if (!configuredApiBase) return false;
   const options = getOpenCodeAPIOptions(config);
+  const apiBase = await resolveReachableOpenCodeApiBase(configuredApiBase, options);
+  if (!apiBase) return false;
 
   try {
     const response = await fetch(`${apiBase}/question/${requestId}/reply`, {
@@ -1133,9 +1548,11 @@ export async function replyOpenCodeQuestion(
 
 export async function rejectOpenCodeQuestion(requestId: string): Promise<boolean> {
   const config = await loadConfig();
-  const apiBase = config.agents.opencode.apiBase;
-  if (!apiBase) return false;
+  const configuredApiBase = config.agents.opencode.apiBase;
+  if (!configuredApiBase) return false;
   const options = getOpenCodeAPIOptions(config);
+  const apiBase = await resolveReachableOpenCodeApiBase(configuredApiBase, options);
+  if (!apiBase) return false;
 
   try {
     const response = await fetch(`${apiBase}/question/${requestId}/reject`, {
@@ -1153,9 +1570,11 @@ export async function rejectOpenCodeQuestion(requestId: string): Promise<boolean
 // standard API cannot approve a plan review — only abort it (doc §4.3).
 export async function abortOpenCodeSession(sessionId: string): Promise<boolean> {
   const config = await loadConfig();
-  const apiBase = config.agents.opencode.apiBase;
-  if (!apiBase) return false;
+  const configuredApiBase = config.agents.opencode.apiBase;
+  if (!configuredApiBase) return false;
   const options = getOpenCodeAPIOptions(config);
+  const apiBase = await resolveReachableOpenCodeApiBase(configuredApiBase, options);
+  if (!apiBase) return false;
 
   try {
     const cleanSessionId = sessionId.replace('opencode-', '');

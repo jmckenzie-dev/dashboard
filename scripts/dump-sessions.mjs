@@ -72,7 +72,7 @@ if (!jsonMode) {
 }
 
 // --- compile the real modules (opencode.ts + its dep graph) ---
-const OUT_DIR = join(ROOT, 'tmp', 'dump-sessions-build');
+const OUT_DIR = join(ROOT, 'tmp', `dump-sessions-build-${process.pid}`);
 rmSync(OUT_DIR, { recursive: true, force: true });
 const tsc = join(ROOT, 'node_modules', '.bin', 'tsc');
 const sources = [

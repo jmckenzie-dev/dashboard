@@ -100,15 +100,6 @@ function openCodeArgIndex(args: string[]): number {
   ) {
     return 1;
   }
-  // bwrap: find the first '--' separator, then look for opencode after it
-  if (basename(args[0]!) === 'bwrap') {
-    const dashDash = args.indexOf('--');
-    if (dashDash !== -1) {
-      for (let i = dashDash + 1; i < args.length; i++) {
-        if (isOpenCodeExecutable(args[i]!)) return i;
-      }
-    }
-  }
   return -1;
 }
 

@@ -1,4 +1,4 @@
-import type { OpenCodeSessionReason } from './types';
+import type { AgentStatus, OpenCodeSessionReason } from './types';
 
 export const RECENT_ACTIVE_FALLBACK_MS = 30_000;
 
@@ -18,6 +18,7 @@ export interface OpenCodeLivenessCandidate {
   parentId?: string | null;
   directory?: string;
   lastActivity: Date;
+  status: AgentStatus;
   hasStatusSignal: boolean;
   hasBlockingRequest: boolean;
   hasActiveTool: boolean;
@@ -101,11 +102,15 @@ export function allocateOpenCodeLiveness(
   for (const [directory, count] of Object.entries(directoryAllocationCounts)) {
     if (count <= 0) continue;
 
+    // `cwd_allocated` is only a weak directory-proximity signal. Do not let it
+    // resurrect a terminal error session just because a different TUI is open
+    // in the same cwd. Direct signals above remain authoritative when present.
     const allocatable = candidates
       .filter((candidate) =>
         candidate.directory === directory
         && !candidate.parentId
-        && !directIds.has(candidate.id),
+        && !directIds.has(candidate.id)
+        && candidate.status !== 'error',
       )
       .sort((a, b) => {
         const activityDiff = b.lastActivity.getTime() - a.lastActivity.getTime();
@@ -124,6 +129,16 @@ export function allocateOpenCodeLiveness(
 
   for (const candidate of candidates) {
     if (decisions.has(candidate.id)) continue;
+
+    // Recent activity is also a weak fallback. An error-status session is
+    // terminal unless one of the direct liveness signals above proves otherwise.
+    if (candidate.status === 'error') {
+      decisions.set(candidate.id, {
+        livenessReason: 'hidden_stale',
+        visibilityReason: 'hidden_stale',
+      });
+      continue;
+    }
 
     if (now - candidate.lastActivity.getTime() <= RECENT_ACTIVE_FALLBACK_MS) {
       decisions.set(candidate.id, {

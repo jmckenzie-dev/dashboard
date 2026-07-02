@@ -93,6 +93,12 @@ assertEqual(parseOpenCodeProcessLine('126 opencode serve --port 35001'), {
   isServe: true,
 }, 'parses serve port');
 
+assertEqual(
+  parseOpenCodeProcessLine('127 bwrap --bind /repo /repo -- /home/me/.opencode/bin/opencode'),
+  null,
+  'rejects bwrap wrapper to avoid double-counting its opencode child',
+);
+
 assertEqual(parseOpenCodeProcessLine('127 bash opencode-ish'), null, 'rejects non-opencode command');
 assertEqual(parseOpenCodeProcessLine('not-a-pid opencode'), null, 'rejects malformed pid');
 

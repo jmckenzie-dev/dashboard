@@ -297,6 +297,45 @@ assert(metricsOutput.includes('dashboard_part_cache_hits_total'), 'metrics conta
 assert(metricsOutput.includes('dashboard_sse_clients_active'), 'metrics contains sse clients active gauge');
 assert(metricsOutput.includes('dashboard_sessions_total'), 'metrics contains sessions total gauge');
 
+// ----------------------------------------------------
+// TEST 5: API-primary SQLite live supplements
+// ----------------------------------------------------
+console.log('\n--- TEST 5: API-primary live supplement selection ---');
+const supplementIds = opencode.liveSupplementSessionIds(
+  [
+    { id: 'opencode-ses_api_present' },
+    { id: 'opencode-ses_status_present' },
+  ],
+  {
+    ses_status_present: { type: 'busy' },
+    ses_status_missing: { type: 'busy' },
+  },
+  {
+    permissionsBySession: new Map([['ses_perm_missing', ['per_1']]]),
+    questionsBySession: new Map([['ses_question_missing', ['que_1']]]),
+  },
+  {
+    liveSessionIds: new Set(['ses_api_present', 'ses_process_missing']),
+  },
+);
+assertEqual(
+  [...supplementIds].sort(),
+  ['ses_perm_missing', 'ses_process_missing', 'ses_question_missing', 'ses_status_missing'],
+  'supplements include only live/blocking/status ids absent from API session list',
+);
+
+const supplementNow = 2_000_000;
+assertEqual(
+  opencode.isRecentSQLiteSupplement({ lastActivity: new Date(supplementNow - 1_000) }, supplementNow),
+  true,
+  'recent SQLite sessions supplement API-first snapshots when proc cwd is unavailable',
+);
+assertEqual(
+  opencode.isRecentSQLiteSupplement({ lastActivity: new Date(supplementNow - 11 * 60 * 1000) }, supplementNow),
+  false,
+  'old SQLite sessions are not blanket supplements in API-first snapshots',
+);
+
 console.log('\n--- Cleanup ---');
 rmSync(OUT_DIR, { recursive: true, force: true });
 rmSync(tempDbPath, { force: true });
