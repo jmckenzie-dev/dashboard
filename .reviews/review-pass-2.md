@@ -1,18 +1,17 @@
-# Code Review (Second Pass)
-
-**Reviewing:** Second-pass review of the stale `process_session_id` / `hasActiveTool` staleness fix  
-**Previous review:** `.reviews/review-pass-1.md` (1 Blocker? 0 | Major: 1 | Minor: 1)
+# Code Review – Pass 2
 
 ## Verdict
 
-**APPROVE**
+**APPROVE** — no blockers, no non-blocking findings.
 
 ## Summary
 
-- The sole [Major] finding from pass 1 (property test invariant broken by PSID suppression) is **correctly resolved**.
-- Test fix is minimal — 7 lines of targeted exemption logic — and covers all edge cases of the stale-PSID suppression scenario.
-- All 200 random seeds pass (1735 property checks, 0 failures). Production checks (`npm run check`, `npm run build`) pass cleanly.
-- No new issues, regressions, or style drift introduced by the test fix.
+The fix adds a single guard in `directReason()` (`opencode-liveness.ts:57`) that
+refuses `active_tool` liveness for `blocked_review` sessions when
+`hasProcessSessionId` is false. The candidate falls through to weaker checks
+(`cwd_allocated`, `recent_active_fallback`, or `hidden_stale`). Four regression
+tests cover the orphaned/live/recent/no-proc-working scenarios. Build and all
+20 tests pass.
 
 ## Blocking findings
 
@@ -20,33 +19,66 @@ None.
 
 ## Non-blocking findings
 
-None new. The [Minor] finding from pass 1 (same-session both-signal `livenessReason` change) remains acknowledged and acceptable — the JSDoc on `directReason` adequately documents the behavior.
+None.
 
-## Test fix correctness analysis
+All four pass-1 deferred findings remain acceptable after re-examination:
 
-The exemption at `scripts/test-opencode-liveness.mjs:192-200` was carefully reviewed for every combination:
+1. **`cwd_allocated` for orphaned `blocked_review`** — The fallthrough to
+   `cwd_allocated` is correct: it only activates when another TUI is actually
+   running in the same directory, and is bounded by the directory process count.
+   An orphaned session seen via cwd-proximity to a live TUI is a tolerable
+   false positive.
 
-| PSID | hasStatusSignal | directory | Other session hasStatusSignal in same dir | Exemption triggers? | Expected behavior | Correct? |
-|------|----------------|-----------|------------------------------------------|---------------------|-------------------|----------|
-| true | false | truthy | true | **yes** — PSID suppressed, assertion skipped | Suppression is correct; test correctly exempts | ✅ |
-| true | false | truthy | false | **no** — no conflict, PSID stays live | Assertion runs, `instanceAlive === true` | ✅ |
-| true | false | falsy | N/A | **no** — `!direct.directory` is false | No suppression (prod line 61 short-circuits on `!candidate.directory`) | ✅ |
-| true | true | any | any | **no** — `!direct.hasStatusSignal` is false | Candidate gets `status_map` liveness; assertion checks `instanceAlive === true` | ✅ |
-| false | any | any | any | **no** — first condition fails | Normal assertion path | ✅ |
+2. **`recent_active_fallback` for orphaned `blocked_review`** — The 30 s window
+   is negligible. By the next poll the session decays to `hidden_stale`. The
+   90 s hysteresis layer already imposes comparable latency for genuine status
+   transitions anyway.
 
-The exemption is precise: it only skips the invariant assertion for the exact scenario where production code suppresses a PSID signal. No other paths are affected.
+3. **Stale-argv race during `/new`** — The `active_tool` check runs before the
+   `process_session_id` stale-argv guard (`directReason` lines 53–62 vs.
+   64–73), so a `blocked_review` session with a stale argv would still receive
+   `active_tool` liveness. However, opencode terminalizes the old session's
+   tool parts after `/new`, so `hasActiveTool` becomes false and the session
+   decays naturally. No evidence of a real exploit path.
 
-## Simplicity and design notes (KISS/YAGNI/DRY/SOLID)
+4. **Property sweep coverage** — `blocked_review` status is absent from the
+   property sweep's random candidate generation. The four targeted regression
+   tests cover the essential cases. Extending the property sweep to include
+   `blocked_review` is deferred to future work (not a blocker).
 
-- The test fix matches the production code's behavior exactly — not broader, not narrower. No speculative exemption.
-- The implementation reuses existing primitives (`candidates.some`, `c.id !== direct.id`) rather than adding test-only utilities. Minimal diff.
-- `hasDirectSignal()` in the test remains unchanged — still includes `hasProcessSessionId` — which is correct because PSID *is* a direct signal in general; only the assertion loop needs an exemption for the suppression case. Removing PSID from `hasDirectSignal` would have broken other invariants (cwd allocation ordering).
+## Simplicity and design notes
+
+- The fix is minimal (4 lines of logic in one function) and follows the existing
+  fallthrough pattern already used by the `ACTIVE_TOOL_LIVENESS_MAX_AGE_MS`
+  staleness check.
+- The guard is narrowly scoped to `blocked_review` — no other status is
+  affected. The accompanying test (`working` + active tool + no process)
+  confirms flagless TUI sessions (common for non-`-s` opencode invocations)
+  still receive `active_tool` liveness.
+- The `hidden_stale` verdict from `directReason()` correctly suppresses the
+  `blocked_review` status-based visibility check in `isVisibleOpenCodeSession`
+  (`index.ts:31` runs before `index.ts:38`). This cross-layer property is
+  essential and is correctly preserved.
 
 ## Test gaps
 
-None in scope. The deterministic tests and property sweep both pass cleanly. The three deterministic test gaps noted in pass 1 (no dedicated staleness-guard test cases) remain but are acceptable — the property sweep exercises the interaction across 200 scenarios.
+- The property sweep (`test-opencode-liveness.mjs` lines 271–364) generates
+  random candidates with `status: rand() < 0.18 ? 'error' : 'idle'` — it never
+  produces `blocked_review`. Extending the status distribution to include
+  `blocked_review` (and `working`, `blocked_permission`, `blocked_question`)
+  would improve coverage, but the four targeted regressions are sufficient for
+  this fix.
+- There is no integration test that exercises the full pipeline (poller →
+  liveness → visibility gate → API response). Such a test would be valuable
+  but is out of scope for this targeted fix.
 
 ## Suggested next steps
 
-1. No further changes needed on this branch. The pass-1 finding is fully resolved.
-2. If test coverage is a priority for future work, add dedicated deterministic test cases for the PSID-staleness-guard scenarios (stale PSID suppressed → `hidden_stale`, same-session both signals → `status_map`, null directory PSID not suppressed).
+1. Deploy and observe that orphaned `blocked_review` sessions (visible after
+   TUI death) now decay to `cwd_allocated` or `hidden_stale` within one poll
+   cycle.
+2. Run `npm run dump:sessions -- --session <substr>` on a known orphaned
+   session to confirm `livenessReason: "cwd_allocated"` (or `"hidden_stale"`)
+   instead of `"active_tool"`.
+3. (Optional) Extend the property sweep to include `blocked_review` and other
+   statuses in the random candidate distribution for broader coverage.
