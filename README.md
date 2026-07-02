@@ -155,6 +155,12 @@ Override the port (auto-falls back if busy unless `TEST_DASHBOARD_PORT_STRICT=1`
 TEST_DASHBOARD_PORT=51000 ./start_test_dashboard.sh
 ```
 
+To fail immediately if the preferred port is busy:
+
+```bash
+TEST_DASHBOARD_PORT=51000 TEST_DASHBOARD_PORT_STRICT=1 ./start_test_dashboard.sh
+```
+
 ## Debugging Session Status
 
 When a session shows an unexpected status (e.g. an `error` session that should be

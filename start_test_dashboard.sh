@@ -51,7 +51,7 @@ if [ "${TEST_DASHBOARD_USE_PROD_CONFIG:-}" = "1" ]; then
 fi
 
 # ── Log setup ─────────────────────────────────
-mkdir -p "$SCRIPT_DIR/logs"
+mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/tmp"
 LOG_FILE="$SCRIPT_DIR/logs/start_test_dashboard_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
