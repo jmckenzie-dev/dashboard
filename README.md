@@ -126,6 +126,35 @@ Notes:
 - No dedicated `lint` script is configured.
 - No test runner is currently configured in this repository.
 
+### Test Dashboard
+
+`./start_test_dashboard.sh` builds the current branch and launches a test
+dashboard on a randomized free port (>=50001), then prints a clickable URL.
+
+```bash
+./start_test_dashboard.sh
+```
+
+Defaults:
+
+- **HTTP** (no certs required), bound to `127.0.0.1` on a random port.
+- **Isolated config/data** under `tmp/test-dashboard/` — settings writes
+  won't touch your production config.
+- Stays in the foreground; press Ctrl-C to stop.
+
+To see live agent sessions and existing auth, opt into production config:
+
+```bash
+./start_test_dashboard.sh --use-prod-config
+# or: TEST_DASHBOARD_USE_PROD_CONFIG=1 ./start_test_dashboard.sh
+```
+
+Override the port (auto-falls back if busy unless `TEST_DASHBOARD_PORT_STRICT=1`):
+
+```bash
+TEST_DASHBOARD_PORT=51000 ./start_test_dashboard.sh
+```
+
 ## Debugging Session Status
 
 When a session shows an unexpected status (e.g. an `error` session that should be

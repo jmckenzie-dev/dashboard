@@ -15,6 +15,7 @@
 # DONE
 
 ## Completed
+- [x] Add `start_test_dashboard.sh` — builds current branch and launches test dashboard on a randomized free port (>=50001) with isolated config/data by default and `--use-prod-config` opt-in.
 - [x] CPU Optimization & Prometheus Instrumentation: implemented background process polling, CWD caching, window function SQLite query consolidation, in-memory part caching, and metrics endpoint (/api/metrics) with self-tests.
 - [x] Group dashboard sessions by status (Error, Blocked, Working, Complete, Idle) and sort by updated descending
 - [x] Implement OpenCode liveness Phase 2 (OS process matching) per docs/reference_comparison.md.
