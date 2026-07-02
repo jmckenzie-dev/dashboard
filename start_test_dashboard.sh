@@ -73,8 +73,8 @@ echo ""
 missing_deps=()
 command -v node  >/dev/null 2>&1 || missing_deps+=("node")
 command -v npm   >/dev/null 2>&1 || missing_deps+=("npm")
-command -v ss    >/dev/null 2>&1 || missing_deps+=("ss (iproute2)")
 command -v git   >/dev/null 2>&1 || missing_deps+=("git")
+command -v ss    >/dev/null 2>&1 || missing_deps+=("ss (iproute2)")
 
 if [ ${#missing_deps[@]} -gt 0 ]; then
   echo "ERROR: Missing required tools: ${missing_deps[*]}" >&2
@@ -90,8 +90,8 @@ fi
 # ── Build ─────────────────────────────────────
 echo "Building..."
 npm run build
-if [ ! -f "build/server.js" ]; then
-  echo "ERROR: Build succeeded but build/server.js not found." >&2
+if [ ! -f "build/index.js" ]; then
+  echo "ERROR: Build succeeded but build/index.js not found." >&2
   exit 1
 fi
 echo "Build complete."
@@ -106,9 +106,21 @@ pick_port() {
     base=$(( (RANDOM % 9999) + 50001 ))
   fi
 
-  # Allow override via env
+  # Allow override via env (must be numeric)
   if [ -n "${TEST_DASHBOARD_PORT:-}" ]; then
+    case "$TEST_DASHBOARD_PORT" in
+      ''|*[!0-9]*)
+        echo "ERROR: TEST_DASHBOARD_PORT must be a number, got '$TEST_DASHBOARD_PORT'" >&2
+        return 1
+        ;;
+    esac
     base="$TEST_DASHBOARD_PORT"
+  fi
+
+  # Validate port range
+  if [ "$base" -lt 1 ] || [ "$base" -gt 65535 ]; then
+    echo "ERROR: Invalid port $base (must be 1-65535)." >&2
+    return 1
   fi
 
   local port="$base"
@@ -155,17 +167,33 @@ fi
 # ── Start server ──────────────────────────────
 echo ""
 echo "Starting test dashboard..."
-PORT=$PORT HOST=127.0.0.1 node "$SCRIPT_DIR/build/server.js" &
+
+# PID file for orphan cleanup: kill any stale server from a previous
+# ungraceful exit before launching a new one.
+PID_FILE="$SCRIPT_DIR/tmp/test-dashboard-server.pid"
+if [ -f "$PID_FILE" ]; then
+  OLD_PID=$(cat "$PID_FILE")
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "Killing stale server (pid $OLD_PID)..."
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$PID_FILE"
+fi
+
+PORT="$PORT" HOST=127.0.0.1 node "$SCRIPT_DIR/build/index.js" &
 SERVER_PID=$!
+echo "$SERVER_PID" > "$PID_FILE"
 echo "Server PID: $SERVER_PID"
 
 # ── Wait for readiness ────────────────────────
 # Strategy: confirm TCP listener via ss, then try an HTTP probe (any
-# response — including 401 — means the server is up). If curl is absent
-# or fails, fall through to a raw TCP connection probe.
+# response — including 401 — means the server is up). ss alone is
+# sufficient when curl is absent (a listening socket means the server
+# process accepted the connection).
 echo "Waiting for server to be ready..."
 ready=false
-for _ in $(seq 1 30); do
+for ((i=0; i<30; i++)); do
   sleep 1
   # Check if process is still alive
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -175,17 +203,15 @@ for _ in $(seq 1 30); do
   fi
   # Check TCP listener via ss
   if ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q .; then
-    # HTTP probe: any response (incl. 401) means server is up
+    # HTTP probe: any response (incl. 401) means server is up.
+    # Use short timeouts so one hung probe doesn't exhaust the budget.
     if command -v curl &>/dev/null; then
-      # curl without -f: success on any HTTP response (200, 401, etc.)
-      if curl -sS -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
+      if curl -sS --connect-timeout 2 --max-time 5 -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
         ready=true
         break
       fi
-    fi
-    # TCP-level probe: used when curl is absent or when curl fails
-    # at the transport level (server not yet accepting connections).
-    if node -e "require('net').createConnection($PORT,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))" 2>/dev/null; then
+    else
+      # No curl: ss listener is sufficient evidence.
       ready=true
       break
     fi
@@ -223,12 +249,15 @@ echo ""
 # ── Foreground + cleanup ─────────────────────
 _cleaned=false
 cleanup() {
-  $_cleaned && return
+  ${_cleaned} && return
   _cleaned=true
   kill "$SERVER_PID" 2>/dev/null || true
+  rm -f "$PID_FILE"
   echo ""
   echo "Stopped test dashboard (pid $SERVER_PID)"
 }
 trap cleanup INT TERM EXIT
 
-wait "$SERVER_PID"
+# Wait in foreground. || true prevents set -e abort if the server
+# exits between the readiness check and this wait.
+wait "$SERVER_PID" || true
