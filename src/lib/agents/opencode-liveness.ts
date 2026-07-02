@@ -52,7 +52,13 @@ function directReason(
   if (candidate.hasBlockingRequest) return 'blocking_request';
   if (candidate.hasActiveTool) {
     if (now - candidate.lastActivity.getTime() <= ACTIVE_TOOL_LIVENESS_MAX_AGE_MS) {
-      return 'active_tool';
+      // blocked_review sessions (submit_plan/plan_exit) require process
+      // confirmation — without a live TUI the tool part is orphaned.
+      if (candidate.status === 'blocked_review' && !candidate.hasProcessSessionId) {
+        // Orphaned: fall through to cwd_allocated / hidden_stale
+      } else {
+        return 'active_tool';
+      }
     }
   }
   if (candidate.hasProcessSessionId) {

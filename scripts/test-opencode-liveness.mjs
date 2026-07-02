@@ -183,6 +183,68 @@ assertEqual(
   '/path-only directory diagnostics do not allocate liveness',
 );
 
+console.log('\n--- blocked_review liveness regressions ---');
+
+// blocked_review without process → hidden_stale (orphaned submit_plan)
+decisions = allocateOpenCodeLiveness([
+  candidate('a-blocked-review-no-proc', {
+    offset: 8 * 60 * 1000,  // 8 min ago
+    status: 'blocked_review',
+    hasActiveTool: true,
+    hasProcessSessionId: false,
+  }),
+], {}, NOW);
+assertEqual(
+  decisions.get('a-blocked-review-no-proc').visibilityReason,
+  'hidden_stale',
+  'blocked_review without process session is hidden_stale',
+);
+
+// blocked_review WITH process → active_tool (legitimate review)
+decisions = allocateOpenCodeLiveness([
+  candidate('a-blocked-review-with-proc', {
+    offset: 8 * 60 * 1000,  // 8 min ago
+    status: 'blocked_review',
+    hasActiveTool: true,
+    hasProcessSessionId: true,
+  }),
+], {}, NOW);
+assertEqual(
+  decisions.get('a-blocked-review-with-proc').visibilityReason,
+  'active_tool',
+  'blocked_review with process session keeps active_tool liveness',
+);
+
+// blocked_review without process but within age bound → hidden_stale
+decisions = allocateOpenCodeLiveness([
+  candidate('a-blocked-review-recent-no-proc', {
+    offset: 60_000,  // 1 min ago (well within 30 min bound)
+    status: 'blocked_review',
+    hasActiveTool: true,
+    hasProcessSessionId: false,
+  }),
+], {}, NOW);
+assertEqual(
+  decisions.get('a-blocked-review-recent-no-proc').visibilityReason,
+  'hidden_stale',
+  'blocked_review without process is hidden_stale even when very recent',
+);
+
+// working with active tool but no process → active_tool (flagless TUI)
+decisions = allocateOpenCodeLiveness([
+  candidate('a-working-no-proc', {
+    offset: 60_000,
+    status: 'working',
+    hasActiveTool: true,
+    hasProcessSessionId: false,
+  }),
+], {}, NOW);
+assertEqual(
+  decisions.get('a-working-no-proc').visibilityReason,
+  'active_tool',
+  'working with active tool keeps active_tool even without process session',
+);
+
 console.log('\n--- allocation property sweep ---');
 function makePrng(seed) {
   let state = seed >>> 0;
