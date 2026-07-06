@@ -1,5 +1,5 @@
 # TODO
-- [ ] Figure out why we're falling back to idle instead of staying on Working
+- [ ] We keep pid if we /new on our session. How does the dashboard handle this?
 - [ ] Show current model for a given session
 - [ ] On settings, add a button to check connectivity to the provided LLM Configuration and print out either green successful connection on test or red connection failed w/failure message. Use popup for both.
 - [ ] On working tasks, calculate and show duration of working on dashboard.
@@ -7,8 +7,6 @@
 - [ ] Debug inability to send messages to agents from interface.
 - [ ] Look into ability to remotely spin up new opencode sessions from http GUI and start new jobs in a new worktree.
 - [ ] Look into ability to register certain projects or create new projects w/the GUI to kick off new feature work.
-
-# DONE
 
 ## Completed
 - [x] Add `start_test_dashboard.sh` — builds current branch and launches test dashboard on a randomized free port (>=50001) with isolated config/data by default and `--use-prod-config` opt-in.
@@ -24,3 +22,4 @@
 - [x] Fix stuck error-status session visible after `/new` — suppress stale `process_session_id` signal when a different session in the same directory is confirmed alive by `/session/status`.
 - [x] Auto collapse w/subagents by default. Show (N subagents active of M total) or something instead in title.
 - [x] Get git repo setup; remote origin at http://192.168.68.110:3000/jmckenzie/agent_dashboard.git. Need to create branch, commit all existing code, and push it.
+- [x] Figure out why we're falling back to idle instead of staying on Working
